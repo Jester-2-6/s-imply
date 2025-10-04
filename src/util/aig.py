@@ -265,6 +265,11 @@ def bench_to_aig(bench_path: str) -> tuple[List[Gate], dict]:
     
     return new_circuit, final_idx_map
 
+def bench_to_aig_file(bench_path: str, aig_path: str):
+    new_circuit, idx_map = bench_to_aig(bench_path)
+    write_bench_file(new_circuit, aig_path)
+    return new_circuit, idx_map
+
 if __name__ == "__main__":
     new_circuit, idx_map = bench_to_aig("data/bench/arbitrary/composite_and.bench")
     write_bench_file(new_circuit, "data/bench/arbitrary/composite_and_aig.bench")
