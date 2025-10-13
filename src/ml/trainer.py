@@ -189,7 +189,7 @@ class ReverseSimulatorTrainer:
         )
         
         # Create embedding extractor for the environment
-        self.env.embedding_extractor = EmbeddingExtractor()
+        self.env.embedding_extractor = EmbeddingExtractor() # type: ignore
         
         # Training metrics
         self.training_history = {
@@ -453,7 +453,7 @@ class ReverseSimulatorTrainer:
                 
                 try:
                     # Load circuit and get embeddings using AIG conversion
-                    struct_emb, func_emb, gate_mapping, circuit_gates = self.env.embedding_extractor.extract_embeddings(circuit_path)
+                    struct_emb, func_emb, gate_mapping, circuit_gates = self.env.embedding_extractor.extract_embeddings(circuit_path) # type: ignore
                     
                     # Find inputs and outputs
                     input_gates = [g for g in circuit_gates if g.type == 1 and g.nfi == 0]
@@ -461,6 +461,13 @@ class ReverseSimulatorTrainer:
                     
                     if len(input_gates) > 0 and len(output_gates) > 0:
                         num_inputs = len(input_gates)
+                        
+                        # Randomly select output gate for consistency
+                        selected_output_idx = random.randint(0, len(output_gates) - 1)
+                        
+                        # Set the selected output gate in environment for simulation consistency
+                        self.env.current_circuit_gates = circuit_gates
+                        self.env.selected_output_gate_idx = selected_output_idx
                         
                         # Prepare input
                         input_embeddings = func_emb[:num_inputs]
@@ -472,7 +479,9 @@ class ReverseSimulatorTrainer:
                             )
                             input_embeddings = torch.cat([input_embeddings, padding], dim=0)
                         
-                        output_embedding = func_emb[num_inputs:num_inputs+len(output_gates)][-1]
+                        # Use the randomly selected output gate's embedding
+                        output_start_idx = len(func_emb) - len(output_gates)
+                        output_embedding = func_emb[output_start_idx + selected_output_idx]
                         
                         # Generate random desired output
                         desired_output = torch.tensor([[random.randint(0, 1)]], 

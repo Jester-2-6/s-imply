@@ -5,11 +5,11 @@ from src.util.io import parse_bench_file, write_bench_file
 
 preserve_type = [GateType.INPT, GateType.FROM, GateType.NOT, GateType.AND]
 
-def _create_gate(gate_type: int, gate_id: int, fanins: List[int], fanouts: List[int] = None) -> Gate:
+def _create_gate(gate_type: int, gate_id: int, fanins: List[int], fanouts: List[int] = []) -> Gate:
     """Helper function to create a gate with proper fanin/fanout counts."""
-    gate = Gate(str(gate_id), gate_type, len(fanins), len(fanouts) if fanouts else 0)
+    gate = Gate(str(gate_id), gate_type, len(fanins), len(fanouts))
     gate.fin = fanins
-    gate.fot = fanouts or []
+    gate.fot = fanouts
     return gate
 
 def _add_gate_to_circuit(new_circuit: List[Gate], gate: Gate) -> None:

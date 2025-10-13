@@ -10,7 +10,7 @@ import glob
 import torch
 import random
 import numpy as np
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 from src.ml.reverse_simulator import ReverseCircuitTransformer
 from src.ml.embedding_extractor import EmbeddingExtractor
@@ -66,7 +66,7 @@ class CircuitDemo:
             GateType.XOR: "XOR",
             GateType.XNOR: "XNOR"
         }
-        return type_map.get(gate_type, f"UNKNOWN({gate_type})")
+        return type_map.get(gate_type, f"UNKNOWN({gate_type})") # type: ignore
     
     def _print_circuit_structure(self, circuit_gates: List, circuit_path: str):
         """Print a formatted view of the circuit structure."""
@@ -142,7 +142,7 @@ class CircuitDemo:
             binary_val = 1 if pred_val > 0.5 else 0
             print(f"{gate.name:<10} {pred_val:<12.4f} {binary_val:<8}")
     
-    def predict_for_circuit(self, circuit_path: str, desired_output: int = None) -> Dict:
+    def predict_for_circuit(self, circuit_path: str, desired_output: int = 0) -> Optional[Dict]:
         """Make a prediction for a given circuit and desired output."""
         print(f"\n🔍 ANALYZING CIRCUIT: {os.path.basename(circuit_path)}")
         
@@ -160,9 +160,8 @@ class CircuitDemo:
             
             num_inputs = len(input_gates)
             
-            # Generate random desired output if not provided
-            if desired_output is None:
-                desired_output = random.randint(0, 1)
+            # Randomly select output gate for consistency
+            selected_output_idx = random.randint(0, len(output_gates) - 1)
             
             # Prepare input embeddings
             input_embeddings = func_emb[:num_inputs]
@@ -172,8 +171,9 @@ class CircuitDemo:
             elif num_inputs > self.max_inputs:
                 input_embeddings = input_embeddings[:self.max_inputs]
             
-            # Prepare output embedding (use last output)
-            output_embedding = func_emb[num_inputs:num_inputs+len(output_gates)][-1]
+            # Prepare output embedding (use randomly selected output)
+            output_start_idx = len(func_emb) - len(output_gates)
+            output_embedding = func_emb[output_start_idx + selected_output_idx]
             
             # Prepare desired output tensor
             desired_output_tensor = torch.tensor([[desired_output]], dtype=torch.float32, device=self.device)
@@ -190,7 +190,7 @@ class CircuitDemo:
             binary_pattern = (predicted_pattern > 0.5).astype(int)
             
             # Simulate the circuit to check if prediction is correct
-            success = self._simulate_circuit(circuit_gates, binary_pattern, desired_output)
+            success = self._simulate_circuit(circuit_gates, binary_pattern, desired_output, selected_output_idx)
             
             # Print results
             self._print_circuit_structure(circuit_gates, circuit_path)
@@ -210,7 +210,7 @@ class CircuitDemo:
             print(f"❌ Error processing circuit: {e}")
             return None
     
-    def _simulate_circuit(self, circuit_gates: List, input_pattern: np.ndarray, desired_output: int) -> bool:
+    def _simulate_circuit(self, circuit_gates: List, input_pattern: np.ndarray, desired_output: int, selected_output_idx: int) -> bool:
         """Simple circuit simulation to verify the prediction."""
         try:
             # Create a mapping of gate values
@@ -220,6 +220,9 @@ class CircuitDemo:
             input_gates = [g for g in circuit_gates if g.type == GateType.INPT and g.nfi == 0]
             for i, gate in enumerate(input_gates):
                 gate_values[gate.name] = input_pattern[i]
+            
+            # Get output gates for selection
+            output_gates = [g for g in circuit_gates if g.type != GateType.INPT and g.nfo == 0]
             
             # Simulate logic gates (simplified)
             for gate in circuit_gates:
@@ -249,10 +252,10 @@ class CircuitDemo:
                         val2 = gate_values.get(str(gate.fin[1]), 0)
                         gate_values[gate.name] = val1 ^ val2
             
-            # Check output
-            output_gates = [g for g in circuit_gates if g.type != GateType.INPT and g.nfo == 0]
-            if output_gates:
-                output_value = gate_values.get(output_gates[-1].name, 0)
+            # Check output (use the same randomly selected output gate)
+            if output_gates and selected_output_idx < len(output_gates):
+                selected_output_gate = output_gates[selected_output_idx]
+                output_value = gate_values.get(selected_output_gate.name, 0)
                 return output_value == desired_output
             
             return False

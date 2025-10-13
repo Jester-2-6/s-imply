@@ -27,7 +27,7 @@ def test_model_creation():
     try:
         # Force CPU to avoid CUDA compatibility issues
         device = torch.device('cpu')
-        model = create_model(device=device)
+        model = create_model(device=device) # type: ignore
         
         # Test forward pass with dummy data
         batch_size = 2
@@ -179,11 +179,12 @@ def test_end_to_end_prediction():
         
         input_embeddings = input_embeddings.unsqueeze(0)  # [1, max_inputs, 128]
         
-        # Output embedding
-        output_embedding = func_emb[num_inputs:num_inputs+len(output_gates)][-1].unsqueeze(0)  # [1, 128]
+        # Randomly select an output gate for consistency (same as training environment)
+        selected_output_idx = np.random.randint(0, len(output_gates))
+        output_embedding = func_emb[num_inputs:num_inputs+len(output_gates)][selected_output_idx].unsqueeze(0)  # [1, 128]
         
         # Create model and predict
-        model = create_model(device=device)
+        model = create_model(device=device) # type: ignore
         
         for desired_output_val in [0, 1]:
             desired_output = torch.tensor([[desired_output_val]], dtype=torch.float32, device=device)
@@ -218,7 +219,7 @@ def test_trainer_creation():
         
         # Create model and trainer
         device = torch.device('cpu')  # Force CPU to avoid CUDA issues
-        model = create_model(device=device)
+        model = create_model(device=device) # type: ignore
         
         trainer = ReverseSimulatorTrainer(
             model=model,

@@ -86,10 +86,12 @@ class ReverseSimulatorEnv(gym.Env):
         self.current_input_embeddings = None
         self.current_output_embedding = None
         self.current_desired_output = None
+        self.embedding_extractor = None  # To be set if DeepGate is used
         self.current_num_inputs = 0
         self.episode_count = 0
+        self.selected_output_gate_idx = None  # Index of randomly selected output gate for consistency
         
-    def reset(self, seed: Optional[int] = None, options: Optional[Dict] = None) -> Tuple[Dict, Dict]:
+    def reset(self, seed: Optional[int] = None, options: Optional[Dict] = None) -> Tuple[Dict, Dict]: # type: ignore
         """Reset the environment with a new random circuit."""
         super().reset(seed=seed)
         
@@ -110,8 +112,8 @@ class ReverseSimulatorEnv(gym.Env):
         
         # Create observation
         observation = {
-            'input_embeddings': self.current_input_embeddings.detach().cpu().numpy(),
-            'output_embedding': self.current_output_embedding.detach().cpu().numpy(),
+            'input_embeddings': self.current_input_embeddings.detach().cpu().numpy(), # type: ignore
+            'output_embedding': self.current_output_embedding.detach().cpu().numpy(), # type: ignore
             'desired_output': self.current_desired_output.detach().cpu().numpy(),
             'num_inputs': self.current_num_inputs
         }
@@ -152,8 +154,8 @@ class ReverseSimulatorEnv(gym.Env):
         )
         
         observation = {
-            'input_embeddings': self.current_input_embeddings.detach().cpu().numpy(),
-            'output_embedding': self.current_output_embedding.detach().cpu().numpy(),
+            'input_embeddings': self.current_input_embeddings.detach().cpu().numpy(), # type: ignore
+            'output_embedding': self.current_output_embedding.detach().cpu().numpy(), # type: ignore
             'desired_output': self.current_desired_output.detach().cpu().numpy(),
             'num_inputs': self.current_num_inputs
         }
@@ -175,7 +177,7 @@ class ReverseSimulatorEnv(gym.Env):
         try:
             # Extract embeddings using AIG conversion
             if hasattr(self, 'embedding_extractor'):
-                struct_emb, func_emb, gate_mapping, circuit_gates = self.embedding_extractor.extract_embeddings(circuit_path)
+                struct_emb, func_emb, gate_mapping, circuit_gates = self.embedding_extractor.extract_embeddings(circuit_path) # type: ignore
             else:
                 # Fallback to direct embedding extraction
                 from src.ml.gcn import bench_to_embed
@@ -188,6 +190,12 @@ class ReverseSimulatorEnv(gym.Env):
             
             self.current_num_inputs = len(input_gates)
             self.current_circuit_gates = circuit_gates
+            
+            # Randomly select one output gate for consistency throughout evaluation cycle
+            if len(output_gates) > 0:
+                self.selected_output_gate_idx = random.randint(0, len(output_gates) - 1)
+            else:
+                self.selected_output_gate_idx = None
             
             # Extract input embeddings (first num_inputs from func_emb)
             if self.current_num_inputs > 0:
@@ -209,11 +217,14 @@ class ReverseSimulatorEnv(gym.Env):
                     device=self.device
                 )
             
-            # Extract output embedding (last output gate)
-            if len(output_gates) > 0:
-                # Use the last output gate's embedding
-                output_idx = len(func_emb) - 1
-                self.current_output_embedding = func_emb[output_idx:output_idx+1]  # [1, embedding_dim]
+            # Extract output embedding (randomly selected output gate)
+            if len(output_gates) > 0 and self.selected_output_gate_idx is not None:
+                # Use the randomly selected output gate's embedding
+                # For simplicity, we'll map the selected output gate to its position in func_emb
+                # This assumes output gates are at the end of func_emb
+                output_start_idx = len(func_emb) - len(output_gates)
+                selected_output_emb_idx = output_start_idx + self.selected_output_gate_idx
+                self.current_output_embedding = func_emb[selected_output_emb_idx:selected_output_emb_idx+1]  # [1, embedding_dim]
             else:
                 self.current_output_embedding = torch.zeros(
                     1, self.embedding_dim, 
@@ -233,6 +244,7 @@ class ReverseSimulatorEnv(gym.Env):
                 device=self.device
             )
             self.current_circuit_gates = []
+            self.selected_output_gate_idx = None
     
     def _simulate_circuit(self, input_pattern: np.ndarray) -> Tuple[float, bool]:
         """
@@ -265,9 +277,11 @@ class ReverseSimulatorEnv(gym.Env):
             
             # Get output value
             output_gates = [g for g in self.current_circuit_gates if g.type != 0 and g.nfo == 0]
-            if len(output_gates) > 0:
-                actual_output = output_gates[-1].val  # Use last output
-                desired_output = int(self.current_desired_output.item())
+            if len(output_gates) > 0 and self.selected_output_gate_idx is not None:
+                # Use the randomly selected output gate
+                selected_output_gate = output_gates[self.selected_output_gate_idx]
+                actual_output = selected_output_gate.val
+                desired_output = int(self.current_desired_output.item()) # type: ignore
                 
                 # Check if simulation was successful
                 success = (actual_output == desired_output)
