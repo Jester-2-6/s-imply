@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import pickle
+import random
 from typing import Dict, Any, List, Optional, Tuple
 
 import torch
@@ -19,7 +20,8 @@ class ReconvergentPathsDataset(Dataset):
     """Dataset for reconvergent path pairs with structural embeddings.
     
     Each sample contains:
-    - paths_emb: [P, L, D] tensor of node embeddings along P paths of length L
+    - paths_emb: [P, L, D+1] tensor of node embeddings along P paths of length L,
+      where the last dimension includes the logic value (0, 1, or 2 for X)
     - attn_mask: [P, L] boolean mask indicating valid positions
     - node_ids: [P, L] tensor of node IDs for constraint checking
     - file: string path to the circuit file
@@ -34,6 +36,9 @@ class ReconvergentPathsDataset(Dataset):
         Preferred value for initialization (unused in current implementation).
     max_path_length : int
         Maximum path length to pad/truncate to.
+    constraint_prob : float
+        Probability of constraining a node to a specific value (0-1).
+        Default is 0.25 (25% of nodes will have initial values).
     """
     
     def __init__(
@@ -42,6 +47,7 @@ class ReconvergentPathsDataset(Dataset):
         device: torch.device = torch.device('cpu'),
         prefer_value: int = 1,
         max_path_length: int = 50,
+        constraint_prob: float = 0.25,
         # Optional fast path: use preprocessed on-disk shards with tensors
         processed_dir: Optional[str] = None,
         load_processed: bool = False,
@@ -50,6 +56,7 @@ class ReconvergentPathsDataset(Dataset):
         self.device = device
         self.prefer_value = prefer_value
         self.max_path_length = max_path_length
+        self.constraint_prob = constraint_prob
         self.processed_dir = processed_dir
         self.load_processed = load_processed
         
@@ -96,6 +103,54 @@ class ReconvergentPathsDataset(Dataset):
             return self._total_len
         return len(self.data)
     
+    def _generate_constraints(self, paths: List[List[int]]) -> Dict[int, int]:
+        """Generate random valid constraints for nodes in the paths.
+        
+        Constraints are applied to a subset of nodes. First and last nodes
+        (reconvergence points) share the same constraint to maintain validity.
+        
+        Parameters
+        ----------
+        paths : list[list[int]]
+            List of paths, each path is a list of node IDs
+            
+        Returns
+        -------
+        dict
+            Mapping from node_id to logic value (0, 1, or 2 for X/unconstrained)
+        """
+        constraints: Dict[int, int] = {}
+        
+        # Collect all unique nodes across paths
+        all_nodes = set()
+        for path in paths:
+            all_nodes.update(path)
+        
+        # First and last nodes should have the same constraint (reconvergence requirement)
+        # Get first node from first path and last node from all paths
+        first_nodes = {path[0] for path in paths if len(path) > 0}
+        last_nodes = {path[-1] for path in paths if len(path) > 0}
+        
+        # Assign a shared value to first nodes
+        if first_nodes:
+            shared_first_value = random.choice([0, 1])
+            for node in first_nodes:
+                constraints[node] = shared_first_value
+        
+        # Assign a shared value to last nodes (reconvergence point)
+        if last_nodes:
+            shared_last_value = random.choice([0, 1])
+            for node in last_nodes:
+                constraints[node] = shared_last_value
+        
+        # For remaining nodes, randomly constrain based on constraint_prob
+        for node in all_nodes:
+            if node not in constraints and random.random() < self.constraint_prob:
+                constraints[node] = random.choice([0, 1])
+        
+        # All other nodes default to X (value 2) - don't explicitly store
+        return constraints
+    
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         """Get a single dataset item.
         
@@ -103,7 +158,7 @@ class ReconvergentPathsDataset(Dataset):
         -------
         dict
             Dictionary with keys:
-            - paths_emb: [P, L, D] embeddings for each node in each path
+            - paths_emb: [P, L, D+1] embeddings with logic value feature appended
             - attn_mask: [P, L] boolean mask (True = valid position)
             - node_ids: [P, L] node IDs for each position
             - file: circuit file path
@@ -117,12 +172,47 @@ class ReconvergentPathsDataset(Dataset):
             attn_mask = self._current_shard['attn_mask'][local_idx].to(self.device)
             node_ids = self._current_shard['node_ids'][local_idx].to(self.device)
             file_path = self._current_shard['files'][local_idx]
-            return {
-                'paths_emb': paths_emb,
-                'attn_mask': attn_mask,
-                'node_ids': node_ids,
-                'file': file_path,
-            }
+            
+            # Add logic value feature if not already present
+            # Check if the last dimension needs the +1 for logic values
+            P, L, D = paths_emb.shape
+            if 'constraints' in self._current_shard:
+                # Preprocessed with constraints
+                return {
+                    'paths_emb': paths_emb,
+                    'attn_mask': attn_mask,
+                    'node_ids': node_ids,
+                    'file': file_path,
+                }
+            else:
+                # Old format, add logic values on-the-fly
+                # Generate constraints and append logic value feature
+                # Extract paths from node_ids to generate constraints
+                paths_list = []
+                for p in range(P):
+                    path = []
+                    for l_idx in range(L):
+                        if attn_mask[p, l_idx]:
+                            path.append(int(node_ids[p, l_idx].item()))
+                    if path:
+                        paths_list.append(path)
+                
+                constraints = self._generate_constraints(paths_list)
+                logic_values = torch.zeros(P, L, 1, dtype=torch.float32, device=self.device)
+                for p in range(P):
+                    for l_idx in range(L):
+                        if attn_mask[p, l_idx]:
+                            node_id = int(node_ids[p, l_idx].item())
+                            logic_values[p, l_idx, 0] = float(constraints.get(node_id, 2))  # Default to X (2)
+                
+                paths_emb_with_value = torch.cat([paths_emb, logic_values], dim=-1)
+                
+                return {
+                    'paths_emb': paths_emb_with_value,
+                    'attn_mask': attn_mask,
+                    'node_ids': node_ids,
+                    'file': file_path,
+                }
 
         entry = self.data[idx]
         
@@ -145,6 +235,9 @@ class ReconvergentPathsDataset(Dataset):
         paths = info['paths']  # [[node_id, ...], [node_id, ...]]
         P = len(paths)
         
+        # Generate constraints for this sample
+        constraints = self._generate_constraints(paths)
+        
         # Determine embedding dimension
         if has_embeddings and struct_emb is not None:
             D = struct_emb.shape[1] if len(struct_emb.shape) > 1 else struct_emb.shape[0]
@@ -155,8 +248,8 @@ class ReconvergentPathsDataset(Dataset):
         max_len = max(len(path) for path in paths)
         L = min(max_len, self.max_path_length)
         
-        # Initialize tensors
-        paths_emb = torch.zeros(P, L, D, dtype=torch.float32, device=self.device)
+        # Initialize tensors with D+1 dimensions to include logic value
+        paths_emb = torch.zeros(P, L, D + 1, dtype=torch.float32, device=self.device)
         attn_mask = torch.zeros(P, L, dtype=torch.bool, device=self.device)
         node_ids = torch.zeros(P, L, dtype=torch.long, device=self.device)
         
@@ -169,6 +262,7 @@ class ReconvergentPathsDataset(Dataset):
                 node_ids[p, pos] = node_id
                 attn_mask[p, pos] = True
                 
+                # Get structural embedding
                 if has_embeddings and struct_emb is not None:
                     # Map original node ID to AIG node ID to get embedding
                     # Note: gate_mapping has string keys/values, but node_id is int
@@ -181,15 +275,19 @@ class ReconvergentPathsDataset(Dataset):
                         if aig_id < struct_emb.shape[0]:
                             embedding = struct_emb[aig_id]
                             if isinstance(embedding, torch.Tensor):
-                                paths_emb[p, pos] = embedding.to(self.device)
+                                paths_emb[p, pos, :D] = embedding.to(self.device)
                             else:
-                                paths_emb[p, pos] = torch.tensor(
+                                paths_emb[p, pos, :D] = torch.tensor(
                                     embedding, dtype=torch.float32, device=self.device
                                 )
                     # else: node not in mapping, use zero embedding
                 else:
                     # Old format: generate random dummy embeddings for consistency
-                    paths_emb[p, pos] = torch.randn(D, dtype=torch.float32, device=self.device)
+                    paths_emb[p, pos, :D] = torch.randn(D, dtype=torch.float32, device=self.device)
+                
+                # Append logic value feature (last dimension)
+                logic_value = constraints.get(node_id, 2)  # Default to X (2) if not constrained
+                paths_emb[p, pos, D] = float(logic_value)
         
         return {
             'paths_emb': paths_emb,

@@ -424,8 +424,9 @@ def cmd_train(args: argparse.Namespace) -> None:
 
     train_loader, val_loader = make_dataloaders(cfg, device)
 
+    # Model input dimension is embedding_dim + 1 to include logic value feature
     model = MultiPathTransformer(
-        embedding_dim=cfg.embedding_dim,
+        embedding_dim=cfg.embedding_dim + 1,
         nhead=cfg.nhead,
         num_encoder_layers=cfg.num_encoder_layers,
         num_interaction_layers=cfg.num_interaction_layers,
