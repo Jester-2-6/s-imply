@@ -6,6 +6,18 @@ Back implication prediction using attention for netlists.
 
 A hybrid RL + supervised learning system for learning to justify reconvergent path structures in digital circuits.
 
+### ⭐ New: Constrained Path Assignments
+
+The system now supports learning with **predefined gate values** (constrained assignments). Instead of all nodes starting as don't-care (X), some nodes have predetermined values (0 or 1) that the model must respect.
+
+**Key Features:**
+- ~25% of nodes get initial constraints
+- Start and end nodes share values for validity  
+- Logic values encoded as additional embedding features
+- Model learns conditional assignments
+
+See **[CONSTRAINED_PATHS.md](CONSTRAINED_PATHS.md)** for details.
+
 ### Quick Start
 
 ```bash
