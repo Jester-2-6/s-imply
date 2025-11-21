@@ -10,9 +10,12 @@ from __future__ import annotations
 import os
 import pickle
 from typing import Dict, Any, List, Optional, Tuple
+from functools import lru_cache
 
 import torch
 from torch.utils.data import Dataset
+from src.util.io import parse_bench_file
+from src.util.struct import GateType
 
 
 class ReconvergentPathsDataset(Dataset):
@@ -45,6 +48,8 @@ class ReconvergentPathsDataset(Dataset):
         # Optional fast path: use preprocessed on-disk shards with tensors
         processed_dir: Optional[str] = None,
         load_processed: bool = False,
+        add_logic_value: bool = True,
+        anchor_in_dataset: bool = False,
     ):
         self.dataset_path = dataset_path
         self.device = device
@@ -52,6 +57,9 @@ class ReconvergentPathsDataset(Dataset):
         self.max_path_length = max_path_length
         self.processed_dir = processed_dir
         self.load_processed = load_processed
+        self.add_logic_value = add_logic_value
+        self.anchor_in_dataset = anchor_in_dataset
+        self._prefer_value = int(prefer_value)
         
         # If using processed mode and cache exists, set up shard index and return
         self._shard_files: List[str] = []
@@ -90,6 +98,42 @@ class ReconvergentPathsDataset(Dataset):
                     print("[WARNING] Using random dummy embeddings. Consider rebuilding with:")
                     print("[WARNING]   python -m src.atpg.reconv_podem")
             print(f"Loaded {len(self.data)} samples from {dataset_path}")
+
+    @staticmethod
+    @lru_cache(maxsize=128)
+    def _load_circuit_cached(bench_file: str):
+        circuit, _ = parse_bench_file(bench_file)
+        return circuit
+
+    @staticmethod
+    def _compatible_anchor_value(gate_type: int, prefer_value: int) -> int:
+        # Heuristic mapping (non-controlling bias)
+        if gate_type == GateType.AND or gate_type == GateType.NAND:
+            return 1
+        if gate_type == GateType.OR or gate_type == GateType.NOR:
+            return 0
+        return int(prefer_value)
+
+    def _gen_anchor_for_sample(self, node_ids: torch.Tensor, attn_mask: torch.Tensor, file_path: str) -> Tuple[int, int, int]:
+        """Pick a random path that has any valid nodes, take its last node,
+        and compute a compatible anchor value. Returns (p, l, v) or (-1,-1,0)."""
+        P, L = node_ids.shape[:2]
+        candidates: List[Tuple[int, int, int]] = []  # (p, last_idx, gate_type)
+        circuit = self._load_circuit_cached(file_path)
+        for p in range(P):
+            valid_positions = attn_mask[p]
+            if bool(valid_positions.any()):
+                last_idx = int(valid_positions.sum().item()) - 1
+                cur_id = int(node_ids[p, last_idx].item())
+                if cur_id > 0:
+                    gty = int(circuit[cur_id].type)
+                    candidates.append((p, last_idx, gty))
+        if not candidates:
+            return -1, -1, 0
+        pick = torch.randint(low=0, high=len(candidates), size=(1,)).item()
+        p_sel, l_sel, g_sel = candidates[int(pick)]
+        v_sel = self._compatible_anchor_value(g_sel, self._prefer_value)
+        return int(p_sel), int(l_sel), int(v_sel)
     
     def __len__(self) -> int:
         if getattr(self, '_use_processed', False):
@@ -117,12 +161,31 @@ class ReconvergentPathsDataset(Dataset):
             attn_mask = self._current_shard['attn_mask'][local_idx].to(self.device)
             node_ids = self._current_shard['node_ids'][local_idx].to(self.device)
             file_path = self._current_shard['files'][local_idx]
-            return {
-                'paths_emb': paths_emb,
-                'attn_mask': attn_mask,
-                'node_ids': node_ids,
-                'file': file_path,
-            }
+            # Optionally integrate anchor hint at dataset level
+            if self.anchor_in_dataset:
+                p_sel, l_sel, v_sel = self._gen_anchor_for_sample(node_ids, attn_mask, file_path)
+                if p_sel >= 0 and l_sel >= 0 and self.add_logic_value and paths_emb.shape[-1] >= 3:
+                    D = paths_emb.shape[-1]
+                    onehot = torch.tensor([1.0, 0.0, 0.0], device=self.device)
+                    if v_sel == 1:
+                        onehot = torch.tensor([0.0, 1.0, 0.0], device=self.device)
+                    paths_emb[p_sel, l_sel, D-3:D] = onehot
+                return {
+                    'paths_emb': paths_emb,
+                    'attn_mask': attn_mask,
+                    'node_ids': node_ids,
+                    'file': file_path,
+                    'anchor_p': torch.tensor(p_sel, dtype=torch.long, device=self.device),
+                    'anchor_l': torch.tensor(l_sel, dtype=torch.long, device=self.device),
+                    'anchor_v': torch.tensor(v_sel, dtype=torch.long, device=self.device),
+                }
+            else:
+                return {
+                    'paths_emb': paths_emb,
+                    'attn_mask': attn_mask,
+                    'node_ids': node_ids,
+                    'file': file_path,
+                }
 
         entry = self.data[idx]
         
@@ -151,12 +214,18 @@ class ReconvergentPathsDataset(Dataset):
         else:
             D = 128  # Default embedding dimension
         
+        # Add 3 dimensions for one-hot logic value (0, 1, X) if enabled
+        if self.add_logic_value:
+            D_total = D + 3
+        else:
+            D_total = D
+        
         # Find max path length in this sample
         max_len = max(len(path) for path in paths)
         L = min(max_len, self.max_path_length)
         
         # Initialize tensors
-        paths_emb = torch.zeros(P, L, D, dtype=torch.float32, device=self.device)
+        paths_emb = torch.zeros(P, L, D_total, dtype=torch.float32, device=self.device)
         attn_mask = torch.zeros(P, L, dtype=torch.bool, device=self.device)
         node_ids = torch.zeros(P, L, dtype=torch.long, device=self.device)
         
@@ -169,6 +238,8 @@ class ReconvergentPathsDataset(Dataset):
                 node_ids[p, pos] = node_id
                 attn_mask[p, pos] = True
                 
+                # Get base structural embedding
+                base_embedding = None
                 if has_embeddings and struct_emb is not None:
                     # Map original node ID to AIG node ID to get embedding
                     # Note: gate_mapping has string keys/values, but node_id is int
@@ -181,22 +252,54 @@ class ReconvergentPathsDataset(Dataset):
                         if aig_id < struct_emb.shape[0]:
                             embedding = struct_emb[aig_id]
                             if isinstance(embedding, torch.Tensor):
-                                paths_emb[p, pos] = embedding.to(self.device)
+                                base_embedding = embedding.to(self.device)
                             else:
-                                paths_emb[p, pos] = torch.tensor(
+                                base_embedding = torch.tensor(
                                     embedding, dtype=torch.float32, device=self.device
                                 )
                     # else: node not in mapping, use zero embedding
                 else:
                     # Old format: generate random dummy embeddings for consistency
-                    paths_emb[p, pos] = torch.randn(D, dtype=torch.float32, device=self.device)
+                    base_embedding = torch.randn(D, dtype=torch.float32, device=self.device)
+                
+                # Handle case where base_embedding is None (node not mapped)
+                if base_embedding is None:
+                    base_embedding = torch.zeros(D, dtype=torch.float32, device=self.device)
+                
+                # Add logic value feature (one-hot encoded: [is_0, is_1, is_X])
+                if self.add_logic_value:
+                    # Initialize all nodes with X (unknown) state: [0, 0, 1]
+                    logic_value_onehot = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32, device=self.device)
+                    # Concatenate base embedding with logic value
+                    paths_emb[p, pos] = torch.cat([base_embedding, logic_value_onehot])
+                else:
+                    paths_emb[p, pos] = base_embedding
         
-        return {
-            'paths_emb': paths_emb,
-            'attn_mask': attn_mask,
-            'node_ids': node_ids,
-            'file': file_path,
-        }
+        # Optionally integrate anchor hint at dataset level
+        if self.anchor_in_dataset:
+            p_sel, l_sel, v_sel = self._gen_anchor_for_sample(node_ids, attn_mask, file_path)
+            if p_sel >= 0 and l_sel >= 0 and self.add_logic_value and paths_emb.shape[-1] >= 3:
+                D = paths_emb.shape[-1]
+                onehot = torch.tensor([1.0, 0.0, 0.0], device=self.device)
+                if v_sel == 1:
+                    onehot = torch.tensor([0.0, 1.0, 0.0], device=self.device)
+                paths_emb[p_sel, l_sel, D-3:D] = onehot
+            return {
+                'paths_emb': paths_emb,
+                'attn_mask': attn_mask,
+                'node_ids': node_ids,
+                'file': file_path,
+                'anchor_p': torch.tensor(p_sel, dtype=torch.long, device=self.device),
+                'anchor_l': torch.tensor(l_sel, dtype=torch.long, device=self.device),
+                'anchor_v': torch.tensor(v_sel, dtype=torch.long, device=self.device),
+            }
+        else:
+            return {
+                'paths_emb': paths_emb,
+                'attn_mask': attn_mask,
+                'node_ids': node_ids,
+                'file': file_path,
+            }
 
     # ------------------------------
     # Processed shard helpers
@@ -370,8 +473,16 @@ def reconv_collate(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     # Find maximum dimensions across the batch
     P = max(item['paths_emb'].size(0) for item in batch)
     L = max(item['paths_emb'].size(1) for item in batch)
-    D = batch[0]['paths_emb'].size(2)
+    D_raw = batch[0]['paths_emb'].size(2)
     B = len(batch)
+    
+    # Pad embedding dimension to be divisible by 4 (common nhead value)
+    # This ensures transformer compatibility
+    nhead = 4
+    if D_raw % nhead == 0:
+        D = D_raw
+    else:
+        D = ((D_raw // nhead) + 1) * nhead
     
     # Initialize batch tensors with zeros/False
     paths = torch.zeros(B, P, L, D, device=device, dtype=torch.float32)
@@ -382,14 +493,24 @@ def reconv_collate(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     # Fill in data from each sample
     for b, item in enumerate(batch):
         p, l_i, d = item['paths_emb'].shape
-        paths[b, :p, :l_i, :] = item['paths_emb']
+        # Copy embeddings (padding happens automatically via zeros initialization)
+        paths[b, :p, :l_i, :d] = item['paths_emb']
         masks[b, :p, :l_i] = item['attn_mask']
         node_ids[b, :p, :l_i] = item['node_ids']
         files.append(item['file'])
     
-    return {
+    out: Dict[str, Any] = {
         'paths_emb': paths,
         'attn_mask': masks,
         'node_ids': node_ids,
         'files': files,
     }
+    # Collate optional anchors if present
+    if 'anchor_p' in batch[0] and 'anchor_l' in batch[0] and 'anchor_v' in batch[0]:
+        ap = torch.stack([item['anchor_p'] for item in batch], dim=0)
+        al = torch.stack([item['anchor_l'] for item in batch], dim=0)
+        av = torch.stack([item['anchor_v'] for item in batch], dim=0)
+        out['anchor_p'] = ap
+        out['anchor_l'] = al
+        out['anchor_v'] = av
+    return out

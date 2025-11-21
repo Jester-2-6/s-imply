@@ -14,16 +14,38 @@ class MultiPathTransformer(nn.Module):
     """
     A Transformer architecture to analyze and predict values for multiple,
     variable-length reconvergent paths.
+
+    Parameters
+    ----------
+    input_dim : int
+        Dimension of incoming node embeddings (from dataset/collate)
+    model_dim : int
+        Internal transformer model dimension (can be larger than input_dim)
+    nhead : int
+        Number of attention heads (must divide model_dim)
+    num_encoder_layers : int
+        Layers for the shared path encoder
+    num_interaction_layers : int
+        Layers for the path interaction encoder
+    dim_feedforward : int
+        Feedforward dimension inside Transformer layers
     """
-    def __init__(self, embedding_dim, nhead, num_encoder_layers, num_interaction_layers, dim_feedforward=512):
+    def __init__(self, input_dim: int, model_dim: int, nhead: int, num_encoder_layers: int, num_interaction_layers: int, dim_feedforward: int = 512):
         super().__init__()
-        self.embedding_dim = embedding_dim
+        self.input_dim = int(input_dim)
+        self.model_dim = int(model_dim)
+
+        # Optional input projection to expand/shrink to model_dim
+        if self.input_dim != self.model_dim:
+            self.input_proj = nn.Linear(self.input_dim, self.model_dim)
+        else:
+            self.input_proj = nn.Identity()
 
         # 1. Shared Path Encoder
         # This single encoder processes each path independently to learn the
         # general features of a logic path.
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=embedding_dim,
+            d_model=self.model_dim,
             nhead=nhead,
             dim_feedforward=dim_feedforward,
             batch_first=True
@@ -34,7 +56,7 @@ class MultiPathTransformer(nn.Module):
         # This layer allows the fully-encoded paths to "talk" to each other.
         # It's another Transformer encoder that treats each path as a single "token".
         interaction_layer = nn.TransformerEncoderLayer(
-            d_model=embedding_dim,
+            d_model=self.model_dim,
             nhead=nhead,
             dim_feedforward=dim_feedforward,
             batch_first=True
@@ -44,7 +66,7 @@ class MultiPathTransformer(nn.Module):
         # 3. Prediction Head
         # A simple linear layer to predict the final logic value (0 or 1) for each node.
         # We use embedding_dim as input and 2 as output for the two classes (0 and 1).
-        self.prediction_head = nn.Linear(embedding_dim, 2)
+        self.prediction_head = nn.Linear(self.model_dim, 2)
         
         # self.pos_encoder = PositionalEncoding(embedding_dim) # Optional: if not already in embeddings
 
@@ -57,46 +79,38 @@ class MultiPathTransformer(nn.Module):
                                      Shape: (batch_size, num_paths, seq_len)
         """
         batch_size, num_paths, seq_len, _ = path_list.shape
-        
+
         # --- Step 1: Encode Each Path Independently ---
         # Reshape the input to process all paths in the batch at once.
-        # (batch_size * num_paths, seq_len, embedding_dim)
-        flat_paths = path_list.view(-1, seq_len, self.embedding_dim)
+        # (batch_size * num_paths, seq_len, input_dim)
+        flat_paths = path_list.view(-1, seq_len, self.input_dim)
+        # Project to model dimension if needed
+        flat_paths = self.input_proj(flat_paths)
         flat_masks = attention_masks.view(-1, seq_len)
-        
+
         # Pass all paths through the same shared encoder.
         encoded_paths = self.shared_path_encoder(flat_paths, src_key_padding_mask=~flat_masks)
-        
+
         # --- Step 2: Allow Paths to Interact ---
-        # To make paths interact, we need a single vector to represent each one.
-        # A common technique is to take the embedding of the first node (like a [CLS] token).
-        path_representations = encoded_paths[:, 0, :] # Shape: (batch_size * num_paths, embedding_dim)
-        
-        # Reshape to group paths by their original batch item.
-        # (batch_size, num_paths, embedding_dim)
-        path_representations = path_representations.view(batch_size, num_paths, self.embedding_dim)
-        
-        # Pass these summary vectors through the interaction layer.
+        # Use the first token as a summary representation for each path.
+        path_representations = encoded_paths[:, 0, :]  # (batch_size * num_paths, model_dim)
+
+        # Group by original batch item: (batch_size, num_paths, model_dim)
+        path_representations = path_representations.view(batch_size, num_paths, self.model_dim)
+
+        # Paths interact through a Transformer operating over the path axis.
         interaction_aware_reps = self.path_interaction_layer(path_representations)
-        
+
         # --- Step 3: Combine and Predict ---
-        # We now combine the global, interaction-aware context with the original node-level details.
-        # One simple way is to add the interaction context back to every node in the path.
-        # Expand interaction_aware_reps to match the sequence length dimension.
-        # New shape: (batch_size, num_paths, 1, embedding_dim) -> broadcasted to seq_len
-        global_context = interaction_aware_reps.unsqueeze(2)
-        
-        # Reshape encoded_paths back to its grouped form
-        # (batch_size, num_paths, seq_len, embedding_dim)
-        encoded_paths = encoded_paths.view(batch_size, num_paths, seq_len, self.embedding_dim)
-        
-        # Combine the original encoded path with the new global context.
+        # Broadcast interaction context back to each node position in each path.
+        global_context = interaction_aware_reps.unsqueeze(2)  # (B, P, 1, model_dim)
+
+        # Reshape encoded paths back to grouped form and add context.
+        encoded_paths = encoded_paths.view(batch_size, num_paths, seq_len, self.model_dim)
         final_representations = encoded_paths + global_context
-        
-        # Pass the final representations through the prediction head.
-        # The output will have shape: (batch_size, num_paths, seq_len, 2)
-        predictions = self.prediction_head(final_representations)
-        
+
+        # Per-node logits
+        predictions = self.prediction_head(final_representations)  # (B, P, L, 2)
         return predictions
 
 # --- Training Logic Placeholder ---
