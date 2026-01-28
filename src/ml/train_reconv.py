@@ -538,6 +538,39 @@ def policy_loss_and_metrics(
         ent_mean = (ent * mask_valid.float()).sum() / torch.clamp(mask_valid.float().sum(), min=1.0)
         loss = loss - float(entropy_beta) * ent_mean
 
+    # Auxiliary Supervised Loss for Anchors
+    if anchor_p is not None and anchor_l is not None and anchor_v is not None:
+        valid_anchors = (anchor_p >= 0) & (anchor_l >= 0)
+        if valid_anchors.any():
+            b_idx = torch.arange(B, device=logits.device)[valid_anchors]
+            p_idx = anchor_p[valid_anchors]
+            l_idx = anchor_l[valid_anchors]
+            targets = anchor_v[valid_anchors].long().clamp(0, 1) # Ensure 0 or 1
+            
+            pred_logits = logits[b_idx, p_idx, l_idx] # [N, 2]
+            sup_loss = F.cross_entropy(pred_logits, targets)
+            loss = loss + 1.0 * sup_loss
+
+    # Auxiliary Consistency Loss for Reconvergent Paths
+    # Penalize variance of logits at the reconvergence point across paths
+    cons_loss_list = []
+    for b in range(B):
+        mask_b = mask_valid[b]
+        last_idx = mask_b.sum(dim=-1) - 1
+        present = last_idx >= 0
+        if present.sum() >= 2:
+            last_idx_clamped = last_idx.clamp(min=0)
+            arange_p = torch.arange(mask_b.size(0), device=logits.device)
+            # Gather logits at the end of each valid path
+            val_logits = logits[b, arange_p, last_idx_clamped][present] # [K, 2]
+            # specific logic: variance from mean
+            mean_logits = val_logits.mean(dim=0, keepdim=True)
+            dist = ((val_logits - mean_logits)**2).mean()
+            cons_loss_list.append(dist)
+    
+    if cons_loss_list:
+        loss = loss + 0.5 * torch.stack(cons_loss_list).mean()
+
     # Report the unnormalized average reward-like signal for monitoring:
     # recompute a view without normalization (no-grad) for logging
     with torch.no_grad():

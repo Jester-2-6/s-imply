@@ -1,12 +1,21 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 
 # --- Helper: Standard Positional Encoding ---
 # Injects position information into the input embeddings.
 class PositionalEncoding(nn.Module):
-    # Standard implementation... (Code omitted for brevity, same as previous examples)
-    pass
+    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+        self.pe = nn.Parameter(torch.randn(max_len, 1, d_model) * 0.1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [batch_size, seq_len, d_model]
+        pe_slice = self.pe[:x.size(1)].transpose(0, 1) # (1, Seq, Dim)
+        x = x + pe_slice
+        return self.dropout(x)
 
 # --- The Main Transformer Architecture ---
 
@@ -68,7 +77,7 @@ class MultiPathTransformer(nn.Module):
         # We use embedding_dim as input and 2 as output for the two classes (0 and 1).
         self.prediction_head = nn.Linear(self.model_dim, 2)
         
-        # self.pos_encoder = PositionalEncoding(embedding_dim) # Optional: if not already in embeddings
+        self.pos_encoder = PositionalEncoding(self.model_dim)
 
     def forward(self, path_list, attention_masks):
         """
@@ -86,6 +95,10 @@ class MultiPathTransformer(nn.Module):
         flat_paths = path_list.view(-1, seq_len, self.input_dim)
         # Project to model dimension if needed
         flat_paths = self.input_proj(flat_paths)
+        
+        # Apply Positional Encoding to learn sequential order (input -> output)
+        flat_paths = self.pos_encoder(flat_paths)
+
         flat_masks = attention_masks.view(-1, seq_len)
 
         # Pass all paths through the same shared encoder.
