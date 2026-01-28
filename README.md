@@ -13,7 +13,7 @@ A hybrid RL + supervised learning system for learning to justify reconvergent pa
 conda activate torch
 
 # Build dataset + train model
-python -m src.ml.train_reconv both \
+python -m src.ml.train_reconv train \
   --bench-dir data/bench/ISCAS85 \
   --dataset data/datasets/reconv_dataset.pkl \
   --checkpoint-dir checkpoints/reconv_rl \
@@ -51,16 +51,25 @@ conda activate torch
 python -m src.ml.train_reconv train \
   --dataset data/datasets/reconv_dataset.pkl \
   --output checkpoints/reconv_minimal \
+  --bench-dir data/bench/ISCAS85 \
   --epochs 5 \
   --batch-size 8 \
-  --embedding-dim 128
+  --amp \
+  --verbose
 
 # Evaluate
 python -m src.ml.evaluate_reconv \
   --checkpoint checkpoints/reconv_minimal/best_model.pth \
-  --dataset data/datasets/reconv_dataset.pkl \
-  --embedding-dim 128
+  --dataset data/datasets/reconv_dataset.pkl
 ```
+
+### New Training Arguments
+
+The training script now supports several additional arguments:
+- `--bench-dir`: Base directory for benchmark files. Paths in the dataset will be resolved relative to this.
+- `--checkpoint-dir`: Alias for `--output`. Sets the directory for saving models.
+- `--amp`: Enables Automatic Mixed Precision (AMP) for faster training and lower memory usage on supported GPUs.
+- `--include-hard-negatives`: Accepted for compatibility; currently placeholder logic for future dataset expansions.
 
 Notes:
 - Defaults to embedding_dim=128 to match the dummy embedding path (when DeepGate is not available).

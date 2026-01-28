@@ -71,6 +71,11 @@ class TrainConfig:
     normalize_reward: bool = True
     entropy_beta: float = 0.01
 
+    # New arguments
+    bench_dir: str = ""
+    amp: bool = False
+    include_hard_negatives: bool = False
+
 
 def make_dataloaders(cfg: TrainConfig, device: torch.device) -> Tuple[DataLoader, DataLoader]:
     # Auto-detect processed shards: look for processed/ subdirectory next to dataset
@@ -580,7 +585,7 @@ def policy_loss_and_metrics(
     return loss, avg_reward, valid_rate
 
 
-def train_one_epoch(model: nn.Module, loader: DataLoader, optim: torch.optim.Optimizer, device: torch.device, cfg: TrainConfig) -> Tuple[float, float, float]:
+def train_one_epoch(model: nn.Module, loader: DataLoader, optim: torch.optim.Optimizer, scaler: torch.cuda.amp.GradScaler, device: torch.device, cfg: TrainConfig) -> Tuple[float, float, float]:
     model.train()
     total_loss = 0.0
     total_batches = 0
@@ -601,6 +606,20 @@ def train_one_epoch(model: nn.Module, loader: DataLoader, optim: torch.optim.Opt
         masks = batch['attn_mask']  # [B, P, L]
         node_ids = batch['node_ids']  # [B, P, L]
         files = batch['files']        # list[str]
+
+        # Resolve paths if bench_dir is provided
+        if cfg.bench_dir:
+            resolved_files = []
+            for f in files:
+                if os.path.exists(f):
+                    resolved_files.append(f)
+                else:
+                    joined = os.path.join(cfg.bench_dir, f)
+                    if os.path.exists(joined):
+                        resolved_files.append(joined)
+                    else:
+                        resolved_files.append(os.path.join(cfg.bench_dir, os.path.basename(f)))
+            files = resolved_files
         # Move to device once per batch for efficiency
         if device.type == 'cuda':
             paths = paths.to(device, non_blocking=True)
@@ -644,20 +663,24 @@ def train_one_epoch(model: nn.Module, loader: DataLoader, optim: torch.optim.Opt
                     print(f"[anchor] batch0: no valid anchors in this batch")
 
         optim.zero_grad(set_to_none=True)
-        logits = model(paths, masks)  # [B, P, L, 2]
-        if cfg.verbose and batch_idx == 0:
-            print(f"[device] batch0 logits device={logits.device}")
-        loss, avg_reward, valid_rate = policy_loss_and_metrics(
-            logits, node_ids, masks, files,
-            anchor_p=anchor_p, anchor_l=anchor_l, anchor_v=anchor_v,
-            anchor_alpha=cfg.anchor_reward_alpha,
-            normalize_reward=cfg.normalize_reward,
-            entropy_beta=cfg.entropy_beta,
-        )
-        # Backprop. Some GPU/Transformer combos can spuriously detect graph reuse when
-        # sampling-based objectives are mixed with encoder reuse; retain_graph mitigates it.
-        loss.backward(retain_graph=True)
-        optim.step()
+        
+        # AMP context
+        with torch.amp.autocast('cuda', enabled=cfg.amp):
+            logits = model(paths, masks)  # [B, P, L, 2]
+            if cfg.verbose and batch_idx == 0:
+                print(f"[device] batch0 logits device={logits.device}")
+            loss, avg_reward, valid_rate = policy_loss_and_metrics(
+                logits, node_ids, masks, files,
+                anchor_p=anchor_p, anchor_l=anchor_l, anchor_v=anchor_v,
+                anchor_alpha=cfg.anchor_reward_alpha,
+                normalize_reward=cfg.normalize_reward,
+                entropy_beta=cfg.entropy_beta,
+            )
+        
+        # Backprop (with scaler if AMP)
+        scaler.scale(loss).backward(retain_graph=True)
+        scaler.step(optim)
+        scaler.update()
 
         total_loss += float(loss.item())
         total_reward += float(avg_reward)
@@ -728,6 +751,20 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, cfg: Tr
         masks = batch['attn_mask']
         node_ids = batch['node_ids']
         files = batch['files']
+        
+        # Resolve paths if bench_dir is provided
+        if cfg.bench_dir:
+            resolved_files = []
+            for f in files:
+                if os.path.exists(f):
+                    resolved_files.append(f)
+                else:
+                    joined = os.path.join(cfg.bench_dir, f)
+                    if os.path.exists(joined):
+                        resolved_files.append(joined)
+                    else:
+                        resolved_files.append(os.path.join(cfg.bench_dir, os.path.basename(f)))
+            files = resolved_files
         if device.type == 'cuda':
             paths = paths.to(device, non_blocking=True)
             masks = masks.to(device, non_blocking=True)
@@ -751,14 +788,15 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, cfg: Tr
         else:
             anchor_p = anchor_l = anchor_v = None  # type: ignore
 
-        logits = model(paths, masks)
-        loss, avg_reward, valid_rate = policy_loss_and_metrics(
-            logits, node_ids, masks, files,
-            anchor_p=anchor_p, anchor_l=anchor_l, anchor_v=anchor_v,
-            anchor_alpha=cfg.anchor_reward_alpha,
-            normalize_reward=cfg.normalize_reward,
-            entropy_beta=cfg.entropy_beta,
-        )
+        with torch.amp.autocast('cuda', enabled=cfg.amp):
+            logits = model(paths, masks)
+            loss, avg_reward, valid_rate = policy_loss_and_metrics(
+                logits, node_ids, masks, files,
+                anchor_p=anchor_p, anchor_l=anchor_l, anchor_v=anchor_v,
+                anchor_alpha=cfg.anchor_reward_alpha,
+                normalize_reward=cfg.normalize_reward,
+                entropy_beta=cfg.entropy_beta,
+            )
         total_loss += float(loss.item())
         total_reward += float(avg_reward)
         total_valid += float(valid_rate)
@@ -832,7 +870,14 @@ def cmd_train(args: argparse.Namespace) -> None:
         model_dim=getattr(args, 'model_dim', 512),
         num_workers=getattr(args, 'num_workers', 4),
         pin_memory=getattr(args, 'pin_memory', True),
+        bench_dir=getattr(args, 'bench_dir', ""),
+        amp=getattr(args, 'amp', False),
+        include_hard_negatives=getattr(args, 'include_hard_negatives', False),
     )
+    
+    # Handle checkpoint-dir alias
+    if getattr(args, 'checkpoint_dir', None):
+        cfg.output = args.checkpoint_dir
 
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     if cfg.verbose:
@@ -873,6 +918,7 @@ def cmd_train(args: argparse.Namespace) -> None:
     ).to(device)
 
     optim = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
+    scaler = torch.amp.GradScaler('cuda', enabled=cfg.amp)
 
     best_val = float('inf')
     if cfg.verbose:
@@ -880,7 +926,7 @@ def cmd_train(args: argparse.Namespace) -> None:
         nb_val = len(val_loader) if hasattr(val_loader, '__len__') else 0
         print(f"Starting training: train_batches={nb_train}, val_batches={nb_val}, batch_size={cfg.batch_size}")
     for epoch in range(1, cfg.epochs + 1):
-        tr_loss, tr_reward, tr_acc = train_one_epoch(model, train_loader, optim, device, cfg)
+        tr_loss, tr_reward, tr_acc = train_one_epoch(model, train_loader, optim, scaler, device, cfg)
         va_loss, va_reward, va_acc = evaluate(model, val_loader, device, cfg)
         print(
             f"Epoch {epoch:03d} | "
@@ -905,6 +951,10 @@ def build_argparser() -> argparse.ArgumentParser:
     t = sub.add_parser('train', help='Run supervised training')
     t.add_argument('--dataset', type=str, default='data/datasets/reconv_dataset.pkl', help='Path to dataset .pkl')
     t.add_argument('--output', type=str, default='checkpoints/reconv_minimal', help='Output checkpoint directory')
+    t.add_argument('--checkpoint-dir', type=str, help='Output checkpoint directory (alias for --output)')
+    t.add_argument('--bench-dir', type=str, default='', help='Base directory for benchmark files')
+    t.add_argument('--amp', action='store_true', help='Enable Automatic Mixed Precision (AMP)')
+    t.add_argument('--include-hard-negatives', action='store_true', help='Include hard negatives (currently ignored)')
     t.add_argument('--epochs', type=int, default=10)
     t.add_argument('--batch-size', type=int, default=8)
     t.add_argument('--verbose', action='store_true')
