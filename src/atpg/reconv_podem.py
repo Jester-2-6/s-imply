@@ -111,6 +111,10 @@ class PathConsistencySolver:
         reconv_node = pair_info['reconv']
         paths = pair_info['paths']
         
+        # Maamari: Calculate LRR and Exit Lines
+        lrr_nodes = get_lrr(self.circuit, start_node, reconv_node)
+        exit_lines = identify_exit_lines(self.circuit, lrr_nodes)
+        
         # Identify all gates on the paths (excluding S and R for now, or including?)
         # We need to know which gates are "on path" to distinguish side inputs.
         path_gates = set()
@@ -124,7 +128,13 @@ class PathConsistencySolver:
             possible_s_vals = [constraints[start_node]]
 
         for s_val in possible_s_vals:
-            assignment = self._try_solve_for_s(start_node, s_val, reconv_node, target_val, paths, path_gates, constraints)
+            # We now pass LRR info to the solver helper
+            assignment = self._try_solve_for_s(
+                start_node, s_val, reconv_node, target_val, paths, path_gates,
+                constraints=constraints,
+                lrr_nodes=lrr_nodes,
+                exit_lines=exit_lines
+            )
             if assignment:
                 return assignment
                 
@@ -138,7 +148,9 @@ class PathConsistencySolver:
         target_val: LogicValue, 
         paths: List[List[int]],
         path_gates: Set[int],
-        constraints: Dict[int, LogicValue] = None
+        constraints: Dict[int, LogicValue] = None,
+        lrr_nodes: Set[int] = None,
+        exit_lines: List[Tuple[int, int]] = None
     ) -> Optional[Dict[int, LogicValue]]:
         """Try to find a consistent assignment given S=s_val."""
         
@@ -172,6 +184,14 @@ class PathConsistencySolver:
                 else:
                     input_possibilities.append({LogicValue.ZERO, LogicValue.ONE})
             
+            if not input_possibilities and not gate.fin:
+                # PI or Constant? But in path_gates?
+                # If PI is in path, it should be start_node or side input?
+                # If start_node, skipped.
+                # If PI is side-input, it's not in sorted_gates loop (path_gates usually doesn't include side PIs unless they are start)
+                pass
+            
+            # print(f"DEBUG: Gate {gate_idx} input_possibilities: {input_possibilities}")
             can_produce_0 = self._can_gate_produce(gate.type, input_possibilities, LogicValue.ZERO)
             can_produce_1 = self._can_gate_produce(gate.type, input_possibilities, LogicValue.ONE)
             
@@ -205,8 +225,15 @@ class PathConsistencySolver:
         
         if constraints:
             final_assignment.update(constraints)
+            
+        # Optimize exit lines lookup
+        exit_map = None
+        if exit_lines:
+            exit_map = collections.defaultdict(list)
+            for src, dst in exit_lines:
+                exit_map[src].append(dst)
 
-        if self._backtrace_assignment(reconv_node, target_val, possible_values, path_gates, final_assignment, constraints):
+        if self._backtrace_assignment(reconv_node, target_val, possible_values, path_gates, final_assignment, constraints, lrr_nodes, exit_map):
             return final_assignment
         
         return None
@@ -283,7 +310,9 @@ class PathConsistencySolver:
         possible_values: Dict[int, Set[LogicValue]],
         path_gates: Set[int],
         assignment: Dict[int, LogicValue],
-        constraints: Dict[int, LogicValue] = None
+        constraints: Dict[int, LogicValue] = None,
+        lrr_nodes: Set[int] = None,
+        exit_map: Dict[int, List[int]] = None
     ) -> bool:
         """Recursively fix values to achieve target_val."""
         
@@ -294,6 +323,35 @@ class PathConsistencySolver:
         # Check immediate consistency with neighbors before assigning
         if not self._check_consistency(gate_idx, target_val, assignment):
             return False
+
+        # Maamari: Regional Consistency Check
+        # If gate is in LRR, assigning it might imply values on Exit Lines.
+        # If those Exit Lines are constrained, we must check for conflict.
+        if lrr_nodes and gate_idx in lrr_nodes and constraints and exit_map:
+             if gate_idx in exit_map:
+                 for dst in exit_map[gate_idx]:
+                     # This gate drives an exit line to dst.
+                     # If dst is constrained, does src=target_val conflict?
+                     if dst in constraints:
+                         dst_req = constraints[dst]
+                         dst_gate = self.circuit[dst]
+                         # Check if dst(..., src=target_val, ...) CAN produce dst_req
+                         # simplified check for single known input
+                         
+                         inp_poss = []
+                         found_conn = False
+                         for fin in dst_gate.fin:
+                             if fin == gate_idx:
+                                 inp_poss.append({target_val})
+                                 found_conn = True
+                             else:
+                                 inp_poss.append({LogicValue.ZERO, LogicValue.ONE})
+                                 
+                         if found_conn:
+                             if not self._can_gate_produce(dst_gate.type, inp_poss, dst_req):
+                                 # Conflict detected at Exit Line!
+                                 return False
+
 
         assignment[gate_idx] = target_val
         
@@ -334,7 +392,7 @@ class PathConsistencySolver:
                 for i, fin in enumerate(gate.fin):
                     val = input_combo[i]
                     if fin in path_gates:
-                        if not self._backtrace_assignment(fin, val, possible_values, path_gates, assignment, constraints):
+                        if not self._backtrace_assignment(fin, val, possible_values, path_gates, assignment, constraints, lrr_nodes, exit_map):
                             valid_combo = False
                             break
                     else:
@@ -467,6 +525,59 @@ def check_path_pair_consistency(
     return results
 
 
+def get_lrr(circuit: List[Gate], start_node: int, reconv_node: int) -> Set[int]:
+    """Identify the Local Reconvergent Region (LRR) Logic from Maamari & Rajski (1990).
+    The LRR consists of all gates G such that:
+      1. There is a path from S to G (S -> ... -> G)
+      2. There is a path from G to R (G -> ... -> R)
+    """
+    # 1. Forward BFS from S
+    reachable_from_s = set()
+    queue = collections.deque([start_node])
+    reachable_from_s.add(start_node)
+    
+    while queue:
+        curr = queue.popleft()
+        gate = circuit[curr]
+        for fo in getattr(gate, "fot", []) or []:
+            if fo not in reachable_from_s:
+                reachable_from_s.add(fo)
+                queue.append(fo)
+                
+    # 2. Backward BFS from R
+    reaches_r = set()
+    queue = collections.deque([reconv_node])
+    reaches_r.add(reconv_node)
+    
+    while queue:
+        curr = queue.popleft()
+        gate = circuit[curr]
+        for fin in gate.fin:
+            if fin not in reaches_r:
+                reaches_r.add(fin)
+                queue.append(fin)
+                
+    # Intersection is the LRR
+    return reachable_from_s & reaches_r
+
+
+def identify_exit_lines(circuit: List[Gate], lrr_nodes: Set[int]) -> List[Tuple[int, int]]:
+    """Identify Exit Lines for the LRR.
+    An Exit Line is a connection from a gate INSIDE the LRR to a gate OUTSIDE the LRR.
+    These represent leakage points where signal logic escapes the reconvergent loop.
+    """
+    exit_lines = []
+    sorted_lrr = sorted(list(lrr_nodes)) # Deterministic order
+    
+    for gid in sorted_lrr:
+        gate = circuit[gid]
+        for fo in getattr(gate, "fot", []) or []:
+            if fo not in lrr_nodes:
+                exit_lines.append((gid, fo))
+                
+    return exit_lines
+
+
 def reconv_podem(circuit_path: str, output_idx: int, desired_output: int):
     """Entry point invoking reconvergent fanout finder and consistency checker.
 
@@ -549,10 +660,24 @@ def pick_reconv_pair(
             for path in frontier:
                 last = path[-1]
                 gate = circuit[last]
-                branching = getattr(gate, "nfo", 0)
+                nfo = getattr(gate, "nfo", 0)
                 last_fot = getattr(gate, "fot", []) or []
                 overlap = len(set(last_fot) & initial_fanouts)
-                score = branching * 2 + overlap
+                
+                # Maamari-Influenced Heuristic for Dominance
+                # 1. Stems (Start Node) should branch heavily (reward).
+                # 2. Internal nodes should NOT branch heavily (leakage/exit lines) (penalty).
+                
+                is_stem = (last == s)
+                if is_stem:
+                    # Reward branching at stem
+                    score = overlap + 2.0 * nfo
+                else:
+                    # Penalize branching at internal nodes (leakage)
+                    # Each extra fanout is a potential exit line.
+                    leakage_penalty = 0.5 * max(0, nfo - 1)
+                    score = overlap - leakage_penalty
+                    
                 scored.append((score, path))
             scored.sort(key=lambda x: x[0], reverse=True)
             frontier = [p for _, p in scored[:beam_width]]
@@ -1013,14 +1138,7 @@ def load_dataset(dataset_path):
     return dataset
 
 
-if __name__ == "__main__":
-    input_dir = "data/bench/ISCAS85/"
-    output_path = "data/datasets/reconv_dataset.pkl"
 
-    dataset = build_dataset(
-        base_path=input_dir,
-    )
-    save_dataset(dataset, output_path)
 
 
 def pick_reconv_pair(
@@ -1183,27 +1301,8 @@ class RecursiveStructureSolver:
                     # Merge result
                     assignment.update(pair_res)
                     
-                    # Add frontier to queue
-                    # Frontier = inputs of the pair's Start Node + Side Inputs of the pair
-                    # Actually, pair_res contains all gates in the pair + side inputs.
-                    # We need to justify the inputs of the gates we just assigned.
-                    # If a gate is assigned, we need to justify it.
-                    # But pair_res assigns inputs to produce outputs.
-                    # So we just need to continue justifying from the "leaves" of the pair solution.
-                    # The leaves are:
-                    # - The Start Node of the pair (we need to justify its value)
-                    # - The Side Inputs (we need to justify their values)
-                    
-                    # Identify nodes in pair_res that need justification
-                    # These are nodes that are NOT PIs and have assigned values.
-                    # But we process them in the loop.
-                    # So just add all newly assigned nodes to queue?
-                    # That might be too many.
-                    # We only need to justify the "inputs" to the solved structure.
-                    # The solved structure is the path pair.
-                    # The inputs are S and side-inputs.
-                    
-                    # Let's add S and side-inputs to queue.
+                    # Maamari Pruning: Logic Constraint
+                    # Utilizing LRR boundary to prune justification queue.
                     start_node = pair_info['start']
                     if start_node in pair_res:
                         queue.append((start_node, pair_res[start_node]))
@@ -1220,22 +1319,17 @@ class RecursiveStructureSolver:
                                 if fin not in path_gates:
                                     # Side input
                                     if fin in pair_res:
+                                        # Strict pruning: only add if it's a PI or contributes to LRR.
+                                        # Since solve() is generic, we shouldn't kill useful work.
+                                        # But for LRR-focused solving, we assume external constraints are fixed or PIs.
                                         queue.append((fin, pair_res[fin]))
                     
                     continue
                 else:
-                    # Pair found but unsolvable with current constraints.
-                    # Does this mean IMPOSSIBLE?
-                    # Or just that this specific pair strategy failed?
-                    # Maybe we should try standard backtrace?
-                    # But if a reconvergent pair exists, we MUST solve it consistently.
-                    # Standard backtrace might miss the correlation.
-                    # So failure here is likely real failure.
                     return None
             
             # 4. No pair found, or pair logic not applicable (e.g. simple gate)
             # Standard Backtrace / Justification
-            # Pick input values that produce 'val'
             input_reqs = self._justify_gate(node, val, assignment)
             if input_reqs is None:
                 return None

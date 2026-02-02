@@ -90,10 +90,14 @@ class MultiPathTransformer(nn.Module):
         )
         self.path_interaction_layer = nn.TransformerEncoder(interaction_layer, num_layers=num_interaction_layers)
         
-        # 3. Prediction Head
+        # 3. Prediction Heads
         # A simple linear layer to predict the final logic value (0 or 1) for each node.
-        # We use embedding_dim as input and 2 as output for the two classes (0 and 1).
         self.prediction_head = nn.Linear(self.model_dim, 2)
+        
+        # New: Global Solvability Head
+        # Predicts if the entire reconvergent structure is solvable (0) or unsolvable (1)
+        # given the target value. Input is pooled from path summaries.
+        self.solvability_head = nn.Linear(self.model_dim, 2)
         
         # 4. Cross-Attention Block
         # Allows path nodes (Query) to attend to all interaction-aware path summaries (Key/Value).
@@ -111,6 +115,9 @@ class MultiPathTransformer(nn.Module):
                                      Shape: (batch_size, num_paths, seq_len)
             gate_types (Tensor, optional): Gate types for each node.
                                            Shape: (batch_size, num_paths, seq_len)
+        Returns:
+            per_node_logits (Tensor): [B, P, L, 2]
+            solvability_logits (Tensor): [B, 2]
         """
         batch_size, num_paths, seq_len, _ = path_list.shape
 
@@ -147,10 +154,6 @@ class MultiPathTransformer(nn.Module):
         interaction_aware_reps = self.path_interaction_layer(path_representations)
 
         # --- Step 3: Combine and Predict ---
-        # Broadcast interaction context back to each node position in each path.
-        # Broadcast interaction context back to each node position in each path.
-        # OLD: global_context = interaction_aware_reps.unsqueeze(2)  # (B, P, 1, model_dim)
-
         # Reshape encoded paths back to grouped form: (batch_size, num_paths, seq_len, model_dim)
         encoded_paths = encoded_paths.view(batch_size, num_paths, seq_len, self.model_dim)
         
@@ -174,16 +177,24 @@ class MultiPathTransformer(nn.Module):
         flat_global_context = global_context.view(-1, 1, self.model_dim)
         
         # Combine: Original Node + CrossAttn Result + Own Summary
-        # This gives the model maximum flexibility: use local info, look at others, or look at own summary.
         final_representations = self.cross_norm(query + attn_out + flat_global_context)
         
-        # Reshape back to (B, P, L, D) for prediction (optional, but prediction_head works on last dim anyway)
+        # Reshape back to (B, P, L, D) for prediction
         final_representations = final_representations.view(batch_size, num_paths, seq_len, self.model_dim)
 
         # Per-node logits
-        predictions = self.prediction_head(final_representations)  # (B, P, L, 2)
-        return predictions
+        per_node_logits = self.prediction_head(final_representations)  # (B, P, L, 2)
 
+        # Global Solvability Prediction
+        # Pool across paths for the batch (e.g., mean pool over path summaries)
+        # interaction_aware_reps: (B, P, D)
+        # We also need to mask paths that were not present if necessary, 
+        # but path_interaction_layer already handles variable paths reasonably.
+        # Let's take the mean over paths.
+        batch_summary = interaction_aware_reps.mean(dim=1) # (B, D)
+        solvability_logits = self.solvability_head(batch_summary) # (B, 2)
+
+        return per_node_logits, solvability_logits
 # --- Training Logic Placeholder ---
 def custom_loss_function(predictions, targets, original_lengths):
     """

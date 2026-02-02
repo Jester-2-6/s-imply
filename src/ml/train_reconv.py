@@ -35,7 +35,8 @@ import torch.nn.functional as F
 from src.ml.reconv_lib import MultiPathTransformer
 from src.ml.reconv_ds import ReconvergentPathsDataset, reconv_collate
 from src.util.io import parse_bench_file
-from src.util.struct import GateType
+from src.util.struct import GateType, LogicValue
+from src.atpg.logic_sim_three import logic_sim, reset_gates
 
 
 @dataclass
@@ -78,6 +79,11 @@ class TrainConfig:
     include_hard_negatives: bool = False
     max_len: int = 0
     use_gate_type_embedding: bool = True
+    
+    # Phase 6: Constrained Training
+    constrained_curriculum: bool = False
+    max_constraint_prob: float = 0.5
+    enforce_constraints: bool = True
 
 
 def make_dataloaders(cfg: TrainConfig, device: torch.device) -> Tuple[DataLoader, DataLoader]:
@@ -183,20 +189,24 @@ def _generate_anchor(
     mask_valid: torch.Tensor,
     files: list[str],
     prefer_value: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """For each batch item, randomly pick one valid path and its last gate,
     then assign a compatible anchor value based on gate type.
+    
+    Verifies if the pick is SOLVABLE or UNSAT using PathConsistencySolver.
 
     Returns:
       - anchor_p: LongTensor [B] with path index, or -1 if none
       - anchor_l: LongTensor [B] with last index along that path, or -1 if none
       - anchor_v: LongTensor [B] with value in {0,1} (0 if none)
+      - solvability: LongTensor [B] with 0 (SAT) or 1 (UNSAT)
     """
     device = node_ids.device
     B, P, L = node_ids.shape[:3]
     anchor_p = torch.full((B,), -1, dtype=torch.long, device=device)
     anchor_l = torch.full((B,), -1, dtype=torch.long, device=device)
     anchor_v = torch.zeros((B,), dtype=torch.long, device=device)
+    solvability = torch.zeros((B,), dtype=torch.long, device=device)
 
     for b in range(B):
         # Collect candidate (path, last_idx) pairs
@@ -212,16 +222,51 @@ def _generate_anchor(
                     candidates.append((p, last_idx, gate_type))
         if not candidates:
             continue
-        # Randomly pick one candidate to avoid bias
+        # Randomly pick one candidate
         pick_i = torch.randint(low=0, high=len(candidates), size=(1,), device=device).item()
         pick_idx = int(pick_i)
         p_sel, l_sel, g_sel = candidates[pick_idx]
         v_sel = _compatible_anchor_value(g_sel, prefer_value)
+        
+        # Verify Solvability
+        from src.atpg.reconv_podem import PathConsistencySolver
+        solver = PathConsistencySolver(circuit)
+        # We need to construct pair_info for the solver
+        # Solver expects 'paths' which is list of list of node IDs.
+        # We can extract them from node_ids for the current sample.
+        current_paths = []
+        for p_idx in range(P):
+            path_b = node_ids[b, p_idx].tolist()
+            # filter zeros
+            path_b = [int(nid) for nid in path_b if nid > 0]
+            if path_b:
+                 current_paths.append(path_b)
+        
+        # Start node is usually the first node of all paths (assuming they all start at same stem)
+        # But let's be safe and check if they do.
+        stems = set(p[0] for p in current_paths)
+        if not stems:
+             continue
+        start_node = list(stems)[0]
+        reconv_node = int(node_ids[b, p_sel, l_sel].item())
+        
+        pair_info = {
+            'start': start_node,
+            'reconv': reconv_node,
+            'paths': current_paths
+        }
+        
+        # Check if target v_sel is possible
+        from src.util.struct import LogicValue
+        target_lv = LogicValue.ZERO if v_sel == 0 else LogicValue.ONE
+        assignment = solver.solve(pair_info, target_lv)
+        
         anchor_p[b] = int(p_sel)
         anchor_l[b] = int(l_sel)
         anchor_v[b] = int(v_sel)
+        solvability[b] = 0 if assignment is not None else 1
 
-    return anchor_p, anchor_l, anchor_v
+    return anchor_p, anchor_l, anchor_v, solvability
 
 
 def _inject_anchor_into_embeddings(
@@ -270,6 +315,8 @@ def _debug_metrics_from_logits(
     anchor_p: "Optional[torch.Tensor]" = None,
     anchor_l: "Optional[torch.Tensor]" = None,
     anchor_v: "Optional[torch.Tensor]" = None,
+    solvability_logits: "Optional[torch.Tensor]" = None,
+    solvability_labels: "Optional[torch.Tensor]" = None,
 ) -> "Dict[str, float]":
     """Compute diagnostic metrics using greedy actions (argmax).
 
@@ -277,8 +324,9 @@ def _debug_metrics_from_logits(
       - edge_acc: fraction of valid edges satisfying local constraints (0..1)
       - reconv_match_rate: fraction of samples with all-last-values-equal among those with >=2 paths
       - anchor_match_rate: fraction of present anchors where predicted value matches (if anchors provided)
-      - edges_per_sample: average number of valid edges per sample
-      - samples_with_edges_frac: fraction of samples with any valid edges
+      - solvability_acc: overall accuracy of SAT/UNSAT prediction
+      - false_unsat_rate: rate of predicting UNSAT when SAT exists
+      - true_unsat_rate: rate of correctly identifying UNSAT cases
     """
     device = logits.device
     B, P, L, _ = logits.shape
@@ -290,7 +338,6 @@ def _debug_metrics_from_logits(
     cur_vals_all = actions[:, :, 1:]
 
     total_edges = valid_edges.sum(dtype=torch.float32).item()
-    samples_with_edges = (valid_edges.view(B, -1).any(dim=1)).float().mean().item()
 
     wrong_edges_total = 0.0
     for b in range(B):
@@ -373,22 +420,48 @@ def _debug_metrics_from_logits(
 
     reconv_match_rate = float(reconv_ok / max(1, reconv_present))
 
-    # Anchor match rate (if provided)
+    # Anchor match rate (only relevant for SAT cases)
     anchor_match_rate = 0.0
     if anchor_p is not None and anchor_l is not None and anchor_v is not None:
         present = (anchor_p >= 0) & (anchor_l >= 0)
+        # Filter for SAT cases if labels provided
+        if solvability_labels is not None:
+             present = present & (solvability_labels == 0)
+             
         if bool(present.any()):
             idx = torch.arange(B, device=device)[present]
             pred_vals = actions[idx, anchor_p[present], anchor_l[present]]
             matches = (pred_vals == anchor_v[present]).float().mean().item()
             anchor_match_rate = float(matches)
 
+    # Solvability Metrics
+    solvability_acc = 0.0
+    false_unsat_rate = 0.0
+    true_unsat_rate = 0.0
+    if solvability_logits is not None and solvability_labels is not None:
+        pred_solv = torch.argmax(solvability_logits, dim=-1)
+        correct = (pred_solv == solvability_labels).float()
+        solvability_acc = correct.mean().item()
+        
+        sat_mask = (solvability_labels == 0)
+        unsat_mask = (solvability_labels == 1)
+        
+        if bool(sat_mask.any()):
+            # False UNSAT = Predicted 1 (UNSAT) when actually 0 (SAT)
+            false_unsat_rate = (pred_solv[sat_mask] == 1).float().mean().item()
+            
+        if bool(unsat_mask.any()):
+            # True UNSAT = Predicted 1 when actually 1
+            true_unsat_rate = (pred_solv[unsat_mask] == 1).float().mean().item()
+
     return {
         'edge_acc': edge_acc,
         'reconv_match_rate': reconv_match_rate,
         'anchor_match_rate': anchor_match_rate,
+        'solvability_acc': solvability_acc,
+        'false_unsat_rate': false_unsat_rate,
+        'true_unsat_rate': true_unsat_rate,
         'edges_per_sample': float(total_edges / max(1, B)),
-        'samples_with_edges_frac': samples_with_edges,
     }
 
 def resolve_gate_types(node_ids: torch.Tensor, files: list[str], device: torch.device) -> torch.Tensor:
@@ -419,15 +492,107 @@ def resolve_gate_types(node_ids: torch.Tensor, files: list[str], device: torch.d
     return gtypes_batch
 
 
+def generate_constraints(
+    node_ids: torch.Tensor, 
+    files: List[str], 
+    prob: float
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Generate ground-truth constraints for a batch using valid logic simulation.
+    
+    Args:
+        node_ids: [B, P, L] Tensor of node IDs
+        files: List of B file paths
+        prob: Probability of masking a node as a constraint
+        
+    Returns:
+        constraint_mask: [B, P, L] Bool tensor (True = constrained)
+        constraint_vals: [B, P, L] Long tensor (0 or 1) - valid values
+    """
+    B, P, L = node_ids.shape
+    device = node_ids.device
+    
+    constraint_mask = torch.zeros((B, P, L), dtype=torch.bool, device=device)
+    constraint_vals = torch.zeros((B, P, L), dtype=torch.long, device=device)
+    
+    if prob <= 0.0:
+        return constraint_mask, constraint_vals
+
+    for b in range(B):
+        circuit = _load_circuit(files[b])
+        # Reset and Simulate with random inputs
+        reset_gates(circuit, len(circuit)-1)
+        
+        # Assign random values to PIs
+        for gate in circuit:
+            if gate.type == GateType.INPT:
+                gate.val = int(torch.randint(0, 2, (1,)).item())
+        
+        # Propagate
+        logic_sim(circuit, len(circuit)-1)
+        
+        # Read values for path nodes
+        # We perform a coin flip for each node to decide if it's constrained
+        # Faster to do it computationally on CPU/numpy then moving to Tensor?
+        # Let's iterate.
+        
+        # Optimize: get all unique node IDs in this sample that are valid (>0)
+        # But we need per-position values.
+        
+        # Batch-level logic for efficiency not fully possible here due to circuit obj structure
+        nid_b = node_ids[b] # [P, L]
+        
+        # Read valid values from circuit
+        # We need to handle the case where node_ids includes padding (0)
+        # valid nodes > 0.
+        
+        # Flatten P, L
+        flat_nid = nid_b.view(-1).cpu().numpy()
+        flat_vals = []
+        for nid in flat_nid:
+            if nid > 0 and nid < len(circuit):
+                val = circuit[nid].val
+                # logic_sim uses {0, 1, 2(X)}. We should only constrain if 0 or 1.
+                if val == 2: # LogicValue.XD
+                    flat_vals.append(-1) 
+                elif val > 2: # D/D_bar etc? logic_sim_three usually produces clean 0/1/X for logic_sim
+                     # logic_sim uses arrays like AND_GATE which output 0,1,2.
+                     # Assuming standard simulation.
+                     flat_vals.append(-1)
+                else:
+                     flat_vals.append(val)
+            else:
+                flat_vals.append(-1)
+        
+        vals_t = torch.tensor(flat_vals, dtype=torch.long, device=device).view(P, L)
+        
+        # Mask generation: Only where we have a valid value (0 or 1)
+        valid_val_mask = vals_t >= 0
+        
+        # Random mask based on prob
+        rand_probs = torch.rand((P, L), device=device)
+        mask_b = (rand_probs < prob) & valid_val_mask
+        
+        constraint_mask[b] = mask_b
+        constraint_vals[b] = vals_t.clamp(0, 1) # -1 becomes 0 but masked out
+
+    return constraint_mask, constraint_vals
+
 def policy_loss_and_metrics(
     logits: torch.Tensor,
     node_ids: torch.Tensor,
     mask_valid: torch.Tensor,
     files: list[str],
     gate_types: torch.Tensor,
+    # Constraints
+    constraint_mask: torch.Tensor | None = None,
+    constraint_vals: torch.Tensor | None = None,
+    # Anchors
     anchor_p: torch.Tensor | None = None,
     anchor_l: torch.Tensor | None = None,
     anchor_v: torch.Tensor | None = None,
+    solvability_logits: torch.Tensor | None = None,
+    solvability_labels: torch.Tensor | None = None,
     anchor_alpha: float = 0.1,
     normalize_reward: bool = True,
     entropy_beta: float = 0.0,
@@ -435,12 +600,63 @@ def policy_loss_and_metrics(
 ) -> tuple[torch.Tensor, float, float, float, float]:
     """Compute REINFORCE loss with LUT-inspired constraints and reconv consistency.
 
-    Returns: (loss, avg_reward, valid_rate, edge_acc, trivial_rate)
+    Returns: (loss, avg_reward, valid_rate, edge_acc, constraint_violation_rate)
     """
 
     B, P, L, C = logits.shape
-    # Sample actions; detach to avoid retaining graph history through the sample op.
+    # Sample actions
     actions = torch.distributions.Categorical(logits=logits).sample().detach()  # [B, P, L]
+    
+    # constraint_metrics
+    constraint_loss = torch.tensor(0.0, device=logits.device)
+    constraint_violation_rate = 0.0
+    
+    # Enforce constraints if provided
+    if constraint_mask is not None and constraint_vals is not None: 
+        if constraint_mask.any():
+            valid_constraints = constraint_mask.view(-1)
+            flat_logits = logits.view(-1, 2)
+            flat_targets = constraint_vals.view(-1)
+            
+            # CE Loss on constrained nodes
+            c_loss = F.cross_entropy(flat_logits[valid_constraints], flat_targets[valid_constraints])
+            constraint_loss = c_loss * 500.0 
+            
+            # Metric: Violation rate
+            preds = actions[constraint_mask]
+            targets = constraint_vals[constraint_mask]
+            violations = (preds != targets).float().sum()
+            total_c = targets.numel()
+            constraint_violation_rate = (violations / max(1, total_c)).item()
+            
+            actions[constraint_mask] = constraint_vals[constraint_mask]
+
+    # Solvability Loss
+    solvability_loss = torch.tensor(0.0, device=logits.device)
+    if solvability_logits is not None and solvability_labels is not None:
+        # Penalize False UNSAT heavily (User: "predicting all instances as unsolvable ... easy to approach")
+        # False UNSAT = Label 0 (SAT), Pred 1 (UNSAT).
+        # We can use weighted cross entropy.
+        weights = torch.tensor([10.0, 1.0], device=logits.device) # Heavy weight on Label 0 to avoid predicting 1
+        solvability_loss = F.cross_entropy(solvability_logits, solvability_labels, weight=weights) * 100.0
+
+    # RL Reward Logic
+    # If UNSAT: reward = 1.0 if correct solvability pred, else -1.0
+    # If SAT: reward based on path consistency as before
+    
+    sat_reward_mask = torch.ones(B, dtype=torch.bool, device=logits.device)
+    unsat_reward = torch.zeros(B, dtype=torch.float32, device=logits.device)
+    
+    if solvability_labels is not None:
+        unsat_mask = (solvability_labels == 1)
+        sat_mask = (solvability_labels == 0)
+        sat_reward_mask = sat_mask
+        
+        if unsat_mask.any():
+            pred_solv = torch.argmax(solvability_logits, dim=-1)
+            correct = (pred_solv[unsat_mask] == 1).float()
+            unsat_reward[unsat_mask] = torch.where(correct == 1, torch.ones_like(correct), torch.full_like(correct, -1.0))
+
     # Compute log-probabilities directly from logits to avoid distribution caching quirks.
     log_probs = torch.log_softmax(logits, dim=-1)  # [B, P, L, C]
     logp = log_probs.gather(-1, actions.unsqueeze(-1)).squeeze(-1)  # [B, P, L]
@@ -448,236 +664,192 @@ def policy_loss_and_metrics(
     # Get probability of 1 (Logic-1) for soft constraints
     probs_1 = torch.softmax(logits, dim=-1)[..., 1]  # [B, P, L]
 
-    wrong_count_list: list[float] = []
-    checked_list: list[float] = []
-    local_wrong_list: list[float] = []
-    reconv_wrong_list: list[float] = []
-    edge_wrong_sum = 0.0
-    edge_total_sum = 0.0
-    soft_edge_loss_list: list[torch.Tensor] = []
+    # Initialize loss accumulator
+    loss = torch.tensor(0.0, device=logits.device, requires_grad=True)
 
-    # Precompute masks for valid adjacent edges once
+    # Vectorized Logic Consistency
+    # ----------------------------
     valid_edges = mask_valid[:, :, 1:] & mask_valid[:, :, :-1]  # [B, P, L-1]
-    prev_vals_all = actions[:, :, :-1]
-    cur_vals_all = actions[:, :, 1:]
     
-    prev_probs_all = probs_1[:, :, :-1]
-    cur_probs_all = probs_1[:, :, 1:]
-    for b in range(B):
-        # Use pre-resolved gate types
-        gtypes_b = gate_types[b]
+    prev_vals = actions[:, :, :-1]
+    cur_vals = actions[:, :, 1:]
+    gt_cur = gate_types[:, :, 1:] # [B, P, L-1]
+    
+    edge_ok = torch.ones_like(prev_vals, dtype=torch.bool)
+    
+    # NOT: cur == 1 - prev
+    m = gt_cur == GateType.NOT
+    edge_ok[m] &= (cur_vals[m] == (1 - prev_vals[m]))
+    
+    # BUFF: cur == prev
+    m = gt_cur == GateType.BUFF
+    edge_ok[m] &= (cur_vals[m] == prev_vals[m])
+    
+    # AND: cur <= prev
+    m = gt_cur == GateType.AND
+    edge_ok[m] &= (cur_vals[m] <= prev_vals[m])
+    
+    # NAND: cur >= 1 - prev
+    m = gt_cur == GateType.NAND
+    edge_ok[m] &= (cur_vals[m] >= (1 - prev_vals[m]))
+    
+    # OR: cur >= prev
+    m = gt_cur == GateType.OR
+    edge_ok[m] &= (cur_vals[m] >= prev_vals[m])
+    
+    # NOR: cur <= 1 - prev
+    m = gt_cur == GateType.NOR
+    edge_ok[m] &= (cur_vals[m] <= (1 - prev_vals[m]))
 
-        prev_vals = prev_vals_all[b].to(logits.device)
-        cur_vals = cur_vals_all[b].to(logits.device)
-        ve_mask = valid_edges[b].to(logits.device)
+    # Gather Edge Errors
+    wrong_edges = (~edge_ok) & valid_edges # [B, P, L-1]
+    
+    # Sample-level stats
+    # local_wrong [B]: number of wrong edges per sample
+    local_wrong = wrong_edges.sum(dim=(1, 2)) # [B]
+    checked = valid_edges.sum(dim=(1, 2)) # [B]
+    
+    edge_wrong_sum = local_wrong.sum().item()
+    edge_total_sum = checked.sum().item()
 
-        # Edge-local constraints (vectorized over P, L-1)
-        gt_cur = gtypes_b[:, 1:]  # gate type at current node for each edge
-        
-        # Define weights for gate types
-        # Boost NOT (4) by 12x (Final Attempt)
-        edge_weights = torch.ones_like(gt_cur, dtype=torch.float32)
-        edge_weights[gt_cur == GateType.NOT] = 12.0
-        
+    # Vectorized Reconvergence Failures
+    # -------------------------------
+    path_len = mask_valid.long().sum(dim=-1) # [B, P]
+    last_idx = (path_len - 1).clamp(min=0)
+    
+    # Gather last values
+    last_idx_exp = last_idx.unsqueeze(-1) # [B, P, 1]
+    last_vals = actions.gather(2, last_idx_exp).squeeze(-1) # [B, P]
+    
+    path_valid_mask = (path_len > 0) # [B, P]
+    
+    # Min/Max across valid paths
+    neg_inf = -999.0
+    pos_inf = 999.0
+    
+    lv_float = last_vals.float()
+    vm_float = path_valid_mask.float()
+    
+    # Max of valid: invalid -> -inf
+    max_v = (lv_float * vm_float + neg_inf * (1 - vm_float)).max(dim=-1).values
+    # Min of valid: invalid -> +inf
+    min_v = (lv_float * vm_float + pos_inf * (1 - vm_float)).min(dim=-1).values
+    
+    # Failure if min < max
+    has_valid_paths = (path_valid_mask.sum(dim=-1) > 0)
+    reconv_fail_mask = (min_v < max_v) & has_valid_paths
+    
+    reconv_wrong = reconv_fail_mask.float() # [B]
 
+    # Reconvergence Consistency Loss (MSE on Logits)
+    # Gather logits at last_idx: [B, P, C]
+    last_idx_logits = last_idx_exp.unsqueeze(-1).expand(actions.size(0), actions.size(1), 1, logits.shape[-1])
+    last_logits = logits.gather(2, last_idx_logits).squeeze(2) # [B, P, C]
+    
+    # Mean logit per sample
+    mask_exp = path_valid_mask.unsqueeze(-1) # [B, P, 1]
+    count_paths = mask_exp.sum(dim=1).clamp(min=1.0) # [B, 1]
+    sum_logits = (last_logits * mask_exp).sum(dim=1) # [B, C]
+    mean_logits = sum_logits / count_paths # [B, C]
+    
+    # MSE
+    diff = (last_logits - mean_logits.unsqueeze(1))
+    mse_per_sample = ((diff ** 2) * mask_exp).sum(dim=(1,2)) / count_paths.squeeze(-1) # [B]
+    
+    loss = loss + 0.5 * mse_per_sample.mean()
 
+    # Vectorized Soft Edge Loss
+    # -------------------------
+    prev_p = probs_1[:, :, :-1]
+    cur_p = probs_1[:, :, 1:]
+    
+    viol = torch.zeros_like(prev_p)
+    
+    # Apply soft constraints
+    # NOT: |cur - (1-prev)|^2
+    m = gt_cur == GateType.NOT
+    viol[m] = (cur_p[m] - (1.0 - prev_p[m])) ** 2
+    
+    # BUFF: |cur - prev|^2
+    m = gt_cur == GateType.BUFF
+    viol[m] = (cur_p[m] - prev_p[m]) ** 2
+    
+    # AND: cur <= prev => ReLU(cur - prev)^2
+    m = gt_cur == GateType.AND
+    viol[m] = F.relu(cur_p[m] - prev_p[m]) ** 2
+    
+    # NAND: cur >= 1-prev => ReLU((1-prev) - cur)^2
+    m = gt_cur == GateType.NAND
+    viol[m] = F.relu((1.0 - prev_p[m]) - cur_p[m]) ** 2
+    
+    # OR: cur >= prev => ReLU(prev - cur)^2
+    m = gt_cur == GateType.OR
+    viol[m] = F.relu(prev_p[m] - cur_p[m]) ** 2
+    
+    # NOR: cur <= 1-prev => ReLU(cur - (1-prev))^2
+    m = gt_cur == GateType.NOR
+    viol[m] = F.relu(cur_p[m] - (1.0 - prev_p[m])) ** 2
+    
+    # Weighting and masking
+    edge_weights = torch.ones_like(gt_cur, dtype=torch.float32)
+    edge_weights[gt_cur == GateType.NOT] = 12.0
+    viol = viol * edge_weights * valid_edges.float()
+    
+    # Loss per sample
+    valid_edge_counts = valid_edges.sum(dim=(1,2)).float().clamp(min=1.0)
+    edge_loss_per_sample = viol.sum(dim=(1,2)) / valid_edge_counts
+    
+    if soft_edge_lambda > 0:
+        loss = loss + float(soft_edge_lambda) * edge_loss_per_sample.mean()
 
-        ok = torch.ones_like(prev_vals, dtype=torch.bool, device=logits.device)
-        # NOT
-        m = gt_cur == GateType.NOT
-        ok[m] &= (1 - prev_vals[m]) == cur_vals[m]
-        # BUFF
-        m = gt_cur == GateType.BUFF
-        ok[m] &= (prev_vals[m] == cur_vals[m])
-        # AND: cur==0 ok; cur==1 requires prev==1
-        m = gt_cur == GateType.AND
-        if m.any():
-            cur_m = cur_vals[m]
-            prev_m = prev_vals[m]
-            ok_m = (cur_m == 0) | ((cur_m == 1) & (prev_m == 1))
-            ok[m] &= ok_m
-        # NAND: cur==1 ok; cur==0 requires prev==1
-        m = gt_cur == GateType.NAND
-        if m.any():
-            cur_m = cur_vals[m]
-            prev_m = prev_vals[m]
-            ok_m = (cur_m == 1) | ((cur_m == 0) & (prev_m == 1))
-            ok[m] &= ok_m
-        # OR: cur==1 ok; cur==0 requires prev==0
-        m = gt_cur == GateType.OR
-        if m.any():
-            cur_m = cur_vals[m]
-            prev_m = prev_vals[m]
-            ok_m = (cur_m == 1) | ((cur_m == 0) & (prev_m == 0))
-            ok[m] &= ok_m
-        # NOR: cur==0 ok; cur==1 requires prev==0
-        m = gt_cur == GateType.NOR
-        if m.any():
-            cur_m = cur_vals[m]
-            prev_m = prev_vals[m]
-            ok_m = (cur_m == 0) | ((cur_m == 1) & (prev_m == 0))
-            ok[m] &= ok_m
-
-        # Soft Edge Constraints (Differentiable)
-        # Using probs_1: prev_p, cur_p
-        prev_p = prev_probs_all[b].to(logits.device)
-        cur_p = cur_probs_all[b].to(logits.device)
-        
-        # Calculate violation per edge
-        viol = torch.zeros_like(prev_p, dtype=torch.float32)
-
-        # NOT: |cur - (1-prev)|^2
-        m = gt_cur == GateType.NOT
-        if m.any():
-            viol[m] = (cur_p[m] - (1.0 - prev_p[m])) ** 2
-            
-        # BUFF: |cur - prev|^2
-        m = gt_cur == GateType.BUFF
-        if m.any():
-            viol[m] = (cur_p[m] - prev_p[m]) ** 2
-            
-        # AND: cur <= prev  => ReLU(cur - prev)^2
-        m = gt_cur == GateType.AND
-        if m.any():
-            viol[m] = F.relu(cur_p[m] - prev_p[m]) ** 2
-            
-        # NAND: cur >= 1 - prev => ReLU((1-prev) - cur)^2
-        m = gt_cur == GateType.NAND
-        if m.any():
-            viol[m] = F.relu((1.0 - prev_p[m]) - cur_p[m]) ** 2
-            
-        # OR: cur >= prev => ReLU(prev - cur)^2
-        m = gt_cur == GateType.OR
-        if m.any():
-            viol[m] = F.relu(prev_p[m] - cur_p[m]) ** 2
-
-        # NOR: cur <= 1 - prev => ReLU(cur - (1-prev))^2
-        m = gt_cur == GateType.NOR
-        if m.any():
-            viol[m] = F.relu(cur_p[m] - (1.0 - prev_p[m])) ** 2
-            
-        # Mask out invalid edges from loss
-        viol = viol * ve_mask.float()
-        
-        # Apply weights 
-        viol = viol * edge_weights
-        
-        if ve_mask.any():
-             soft_edge_loss_list.append(viol.sum() / ve_mask.sum().float().clamp(min=1.0))
-
-        wrong_edges = (~ok) & ve_mask
-        wrong = wrong_edges.sum(dtype=torch.float32).item()
-        checked = ve_mask.sum(dtype=torch.float32).item()
-
-        # Track local vs reconv errors separately
-        local_wrong = float(wrong) # 'wrong' currently has only edge errors
-        rec_wrong = 0.0
-        
-        edge_wrong_sum += local_wrong
-        edge_total_sum += checked
-        
-        # Accumulate edge accuracy lists for batch reporting
-        # (Assuming edge_wrong_list/edge_total_list were placeholders, actually removed them in previous edits but let's just stick to vars)
-
-        # Reconvergence consistency: compare last values across paths
-        mask_b = mask_valid[b]
-        last_idx = mask_b.sum(dim=-1) - 1  # [P]
-        present = last_idx >= 0
-        if bool(present.any()):
-            # clamp for gather safety
-            last_idx_clamped = last_idx.clamp(min=0)
-            arange_p = torch.arange(mask_b.size(0), device=logits.device)
-            last_vals = actions[b, arange_p, last_idx_clamped]
-            last_vals = last_vals[present]
-            n_present = int(present.sum().item())
-            if n_present >= 2:
-                ref = last_vals[0]
-                mism = (last_vals[1:] != ref).sum(dtype=torch.float32).item()
-                rec_wrong = float(mism)
-                # Don't add to checked for edge_accuracy calculation, but for reward denom yes.
-                checked += float(n_present - 1)
-
-        local_wrong_list.append(local_wrong)
-        reconv_wrong_list.append(rec_wrong)
-        # Total wrong for "valid" status check (still useful for valid_rate)
-        wrong_count_list.append(local_wrong + rec_wrong)
-        checked_list.append(float(checked))
-        
-    checked_t = torch.tensor(checked_list, dtype=torch.float32, device=logits.device)
-    wrong_t = torch.tensor(wrong_count_list, dtype=torch.float32, device=logits.device)
-    local_wrong_t = torch.tensor(local_wrong_list, dtype=torch.float32, device=logits.device)
-    reconv_wrong_t = torch.tensor(reconv_wrong_list, dtype=torch.float32, device=logits.device)
+    # Reward Logic
+    # ----------------------------
+    # Granular reward based on edge satisfaction to provide a smoother gradient.
+    local_err = local_wrong.float()
+    reconv_err = reconv_wrong.float()
+    denom_edges = checked.float().clamp(min=1.0)
     
-    # NEW DEFINITION:
-    # A sample is VALID if it has NO errors (wrong_t == 0).
-    # If checked_t == 0 (trivial case), it has no errors, so it is valid.
-    # We track 'trivial' separately.
-    valid = (wrong_t == 0)
-    trivial = (checked_t == 0)
+    # Calculate local consistency reward as a fraction in [0, 1] mapped to [-1, 1]
+    local_reward_shaping = (1.0 - (local_err / denom_edges)) * 2.0 - 1.0
     
-    # Reward:
-    # If trivial: 0.0 (neutral) or 1.0 (good)? 
-    # Let's say 1.0 because it satisfies constraints (vacuously).
-    # If non-trivial and valid: 1.0.
-    # If invalid: -wrong/checked.
+    # Base reward starts with local shaping
+    base_reward = local_reward_shaping
     
-    denom = torch.clamp(checked_t, min=1.0)
-    # If valid (wrong==0), reward is 1.0. Even if trivial.
-    # If invalid (wrong>0), reward is -wrong/denom.
-    # GATED REWARD LOGIC:
-    # 1. If Local Logic Fails (local_wrong > 0): Reward = -1.0 (Hard Penalty)
-    # 2. Else (Local Logic OK):
-    #    If Reconv Fails (reconv_wrong > 0): Reward = -reconv_wrong / checked (Proportional Penalty)
-    #    Else (Perfect): Reward = 1.0
+    # Apply reconvergence penalty if paths disagree
+    # If reconv fails, we cap the reward to be negative or low
+    reconv_penalty = -1.0
+    base_reward = torch.where(reconv_err == 0, base_reward, torch.min(base_reward, torch.tensor(reconv_penalty, device=logits.device)))
     
-    # Base reward tensor filled with -1.0 (Worst case default)
-    base_reward = torch.full_like(checked_t, -1.0)
-    
-    # Mask where local logic is OK
-    local_ok = (local_wrong_t == 0)
-    
-    # For local_ok samples, calculate reward based on reconv
-    # If reconv_wrong_t == 0, reward is 1.0
-    # If reconv_wrong_t > 0, reward is -reconv_wrong / checked
-    
-    denom = torch.clamp(checked_t, min=1.0)
-    reconv_penalty = -reconv_wrong_t / denom
-    
-    # If local OK:
-    #   if reconv OK (wrong_t == 0) -> 1.0
-    #   else -> reconv_penalty
-    
-    reconv_ok = (reconv_wrong_t == 0)
-    
-    # Where local_ok is true:
-    # reward = 1.0 if reconv_ok else reconv_penalty
-    reward_if_local_ok = torch.where(reconv_ok, torch.ones_like(base_reward), reconv_penalty)
-    
-    # Apply to base_reward
-    base_reward = torch.where(local_ok, reward_if_local_ok, base_reward)
-    
-    # Special case: Trivial samples (checked == 0) -> 1.0
+    # Neutral/positive for trivial samples (no edges)
+    trivial = (checked == 0)
     base_reward = torch.where(trivial, torch.ones_like(base_reward), base_reward)
     
-    reward = base_reward
-    
-    # Anchor reward shaping: encourage model to place the anchor value.
+    # Combined Reward for SAT/UNSAT
+    reward = base_reward.clone()
+    if solvability_labels is not None:
+        reward = torch.where(sat_reward_mask, reward, unsat_reward)
+
+    # Anchor reward shaping
     if anchor_p is not None and anchor_l is not None and anchor_v is not None:
-        idx = torch.arange(B, device=logits.device)
+        idx = torch.arange(logits.size(0), device=logits.device)
         present = (anchor_p >= 0) & (anchor_l >= 0)
+        if solvability_labels is not None:
+            present = present & (solvability_labels == 0)
+            
         if bool(present.any()):
-            pred_vals = torch.zeros(B, dtype=torch.long, device=logits.device)
-            pred_vals[present] = actions[idx[present], anchor_p[present], anchor_l[present]]
+            pred_vals = torch.zeros(logits.size(0), dtype=torch.long, device=logits.device)
+            p_idx = anchor_p[present]
+            l_idx = anchor_l[present]
+            pred_vals[present] = actions[idx[present], p_idx, l_idx]
             matches = (pred_vals == anchor_v) & present
-            anchor_signal = torch.zeros(B, dtype=torch.float32, device=logits.device)
+            anchor_signal = torch.zeros(logits.size(0), dtype=torch.float32, device=logits.device)
             anchor_signal[matches] = 1.0
             anchor_signal[present & (~matches)] = -1.0
             reward = reward + float(anchor_alpha) * anchor_signal
             
-    # Keep reward in a reasonable range
     reward = torch.clamp(reward, min=-1.0, max=1.0)
 
-    # Optional per-batch normalization to stabilize gradients
+    # Optional per-batch normalization
     if normalize_reward:
         mean_r = reward.mean()
         std_r = reward.std().clamp(min=1e-6)
@@ -686,79 +858,69 @@ def policy_loss_and_metrics(
     # Detach reward for REINFORCE
     reward = reward.detach()
 
-    # Policy gradient loss: -mean(reward * mean logp over valid positions)
+    # Policy gradient loss
     logp_sum = (logp * mask_valid).sum(dim=(1, 2))  # [B]
     count = torch.clamp(mask_valid.sum(dim=(1, 2)).float(), min=1.0)
     per_sample_loss = -(reward * (logp_sum / count))  # [B]
-    loss = per_sample_loss.mean()
+    loss = loss + per_sample_loss.mean()
 
-    # Entropy regularization to encourage exploration
+    # Entropy regularization
     if entropy_beta > 0.0:
         probs = torch.softmax(logits, dim=-1)
         ent = -(probs * torch.log_softmax(logits, dim=-1)).sum(dim=-1)  # [B,P,L]
         ent_mean = (ent * mask_valid.float()).sum() / torch.clamp(mask_valid.float().sum(), min=1.0)
         loss = loss - float(entropy_beta) * ent_mean
 
-    # Auxiliary Supervised Loss for Anchors
+    # Auxiliary Supervised Loss for Anchors (ONLY if SAT)
     if anchor_p is not None and anchor_l is not None and anchor_v is not None:
         valid_anchors = (anchor_p >= 0) & (anchor_l >= 0)
+        if solvability_labels is not None:
+            valid_anchors = valid_anchors & (solvability_labels == 0)
+            
         if valid_anchors.any():
-            b_idx = torch.arange(B, device=logits.device)[valid_anchors]
+            b_idx = torch.arange(logits.size(0), device=logits.device)[valid_anchors]
             p_idx = anchor_p[valid_anchors]
             l_idx = anchor_l[valid_anchors]
-            targets = anchor_v[valid_anchors].long().clamp(0, 1) # Ensure 0 or 1
-            
+            targets = anchor_v[valid_anchors].long().clamp(0, 1)
             pred_logits = logits[b_idx, p_idx, l_idx] # [N, 2]
             sup_loss = F.cross_entropy(pred_logits, targets)
             loss = loss + 1.0 * sup_loss
-
-    # Auxiliary Consistency Loss for Reconvergent Paths
-    # Penalize variance of logits at the reconvergence point across paths
-    cons_loss_list = []
-    for b in range(B):
-        mask_b = mask_valid[b]
-        last_idx = mask_b.sum(dim=-1) - 1
-        present = last_idx >= 0
-        if present.sum() >= 2:
-            last_idx_clamped = last_idx.clamp(min=0)
-            arange_p = torch.arange(mask_b.size(0), device=logits.device)
-            # Gather logits at the end of each valid path
-            val_logits = logits[b, arange_p, last_idx_clamped][present] # [K, 2]
-            # specific logic: variance from mean
-            mean_logits = val_logits.mean(dim=0, keepdim=True)
-            dist = ((val_logits - mean_logits)**2).mean()
-            cons_loss_list.append(dist)
     
-    if cons_loss_list:
-        loss = loss + 0.5 * torch.stack(cons_loss_list).mean()
-        
-    # Soft Edge Consistency Loss
-    if soft_edge_loss_list and soft_edge_lambda > 0:
-        edge_loss = torch.stack(soft_edge_loss_list).mean()
-        loss = loss + float(soft_edge_lambda) * edge_loss
+    # Add constraint loss and solvability loss
+    loss = loss + constraint_loss + solvability_loss
 
-    # Report the unnormalized average reward-like signal for monitoring:
-    # recompute a view without normalization (no-grad) for logging
+    # Recompute metrics for logging
     with torch.no_grad():
-        avg_reward = float(base_reward.mean().item())
+        avg_reward = float(reward.mean().item()) # Using adjusted reward
         
-    valid_rate = float(valid.float().mean().item())
-    trivial_rate = float(trivial.float().mean().item())
-    edge_acc = float((edge_total_sum - edge_wrong_sum) / max(1.0, edge_total_sum))
-    
-    return loss, avg_reward, valid_rate, edge_acc, trivial_rate
+        # Valid = local OK & reconv OK & non-trivial
+        trivial = (checked == 0)
+        valid = (local_err == 0) & (reconv_err == 0) & (~trivial)
+        
+        # For valid_rate, we only consider SAT cases as potentially "valid" in terms of consistency.
+        # This keeps the metric stable.
+        if solvability_labels is not None:
+             valid = valid & (solvability_labels == 0)
+             denom_count = (solvability_labels == 0).float().sum().item()
+        else:
+             denom_count = B
+             
+        valid_rate = float(valid.float().sum().item() / max(1.0, denom_count))
+        
+        edge_acc = float((edge_total_sum - edge_wrong_sum) / max(1.0, edge_total_sum))
+
+    return loss, avg_reward, valid_rate, edge_acc, constraint_violation_rate
 
 
-def train_one_epoch(model: nn.Module, loader: DataLoader, optim: torch.optim.Optimizer, scaler: torch.cuda.amp.GradScaler, device: torch.device, cfg: TrainConfig) -> Tuple[float, float, float, float, float]:
+def train_one_epoch(model: nn.Module, loader: DataLoader, optim: torch.optim.Optimizer, scaler: torch.cuda.amp.GradScaler, device: torch.device, cfg: TrainConfig, epoch: int = 1) -> Tuple[float, float, float, float, float]:
     model.train()
-    total_loss = 0.0
-    total_batches = 0
-    total_reward = 0.0
-    total_valid = 0.0
-    total_edge_acc = 0.0
-    total_trivial = 0.0
+    total_loss, total_reward, total_valid, total_batches, total_edge_acc = 0.0, 0.0, 0.0, 0, 0.0
+    total_trivial = 0.0 # Stores constraint violation rate
+    
     start_time = time.time()
-    # Target batch count for ETA (respect caps if provided)
+    bdone = 0
+    
+    # Target batch count for ETA
     try:
         loader_len = len(loader)
     except Exception:
@@ -767,77 +929,74 @@ def train_one_epoch(model: nn.Module, loader: DataLoader, optim: torch.optim.Opt
     if cfg.max_train_batches > 0:
         target_batches = cfg.max_train_batches if target_batches is None else min(cfg.max_train_batches, target_batches)
 
-    for batch_idx, batch in enumerate(loader):
-        paths = batch['paths_emb']  # [B, P, L, D]
-        masks = batch['attn_mask']  # [B, P, L]
-        node_ids = batch['node_ids']  # [B, P, L]
-        files = batch['files']        # list[str]
+    # Curriculum for constraints
+    constraint_prob = 0.0
+    if cfg.constrained_curriculum and cfg.epochs > 0:
+        progress = epoch / cfg.epochs
+        constraint_prob = cfg.max_constraint_prob * progress
+        
+    if cfg.verbose:
+        print(f"[curriculum] epoch={epoch} constraint_prob={constraint_prob:.3f}")
 
-        # Resolve paths if bench_dir is provided
-        if cfg.bench_dir:
-            resolved_files = []
-            for f in files:
-                if os.path.exists(f):
-                    resolved_files.append(f)
-                else:
-                    joined = os.path.join(cfg.bench_dir, f)
-                    if os.path.exists(joined):
-                        resolved_files.append(joined)
-                    else:
-                        resolved_files.append(os.path.join(cfg.bench_dir, os.path.basename(f)))
-            files = resolved_files
-        # Move to device once per batch for efficiency
+    for batch_idx, batch in enumerate(loader):
+        paths = batch['paths_emb']
+        masks = batch['attn_mask']
+        node_ids = batch['node_ids']
+        files = batch['files']
+        
         if device.type == 'cuda':
             paths = paths.to(device, non_blocking=True)
             masks = masks.to(device, non_blocking=True)
             node_ids = node_ids.to(device, non_blocking=True)
-        if cfg.verbose and batch_idx == 0:
-            print(f"[device] batch0 paths_emb device={paths.device}, masks device={masks.device}")
 
-        # Prefer dataset-provided anchors if available; else generate procedurally
-        if cfg.anchor_hint and 'anchor_p' in batch and 'anchor_l' in batch and 'anchor_v' in batch:
-            anchor_p = batch['anchor_p']
-            anchor_l = batch['anchor_l']
-            anchor_v = batch['anchor_v']
-            if device.type == 'cuda':
-                anchor_p = anchor_p.to(device, non_blocking=True)
-                anchor_l = anchor_l.to(device, non_blocking=True)
-                anchor_v = anchor_v.to(device, non_blocking=True)
-            # Embeddings already contain the anchor one-hot from dataset (if enabled)
-        elif cfg.anchor_hint:
-            # Generate on CPU to avoid syncs with Python-side circuit parsing
-            anchor_p_cpu, anchor_l_cpu, anchor_v_cpu = _generate_anchor(node_ids.detach().cpu(), masks.detach().cpu(), files, cfg.prefer_value)
-            anchor_p = anchor_p_cpu.to(device)
-            anchor_l = anchor_l_cpu.to(device)
-            anchor_v = anchor_v_cpu.to(device)
-            paths = _inject_anchor_into_embeddings(paths, anchor_p, anchor_l, anchor_v, enable=cfg.add_logic_value)
+        # Generate Constraints
+        c_prob = constraint_prob
+        c_mask, c_vals = generate_constraints(node_ids, files, prob=c_prob)
+
+        # Inject constraints into embeddings
+        if cfg.add_logic_value and c_mask.any():
+            D = paths.shape[-1]
+            if D >= 3:
+                valid_mask = c_mask
+                if valid_mask.any():
+                    targets = c_vals[valid_mask]
+                    one_hot = torch.zeros((targets.shape[0], 3), device=device, dtype=paths.dtype)
+                    one_hot.scatter_(1, targets.unsqueeze(1), 1.0)
+                    paths_flat = paths.view(-1, D)
+                    mask_flat = valid_mask.view(-1)
+                    paths_flat[mask_flat, D-3:D] = one_hot
+
+        # Anchors and Solvability
+        if cfg.anchor_hint:
+             ap_cpu, al_cpu, av_cpu, s_cpu = _generate_anchor(node_ids.detach().cpu(), masks.detach().cpu(), files, cfg.prefer_value)
+             anchor_p = ap_cpu.to(device)
+             anchor_l = al_cpu.to(device)
+             anchor_v = av_cpu.to(device)
+             solv_labels = s_cpu.to(device)
+             paths = _inject_anchor_into_embeddings(paths, anchor_p, anchor_l, anchor_v, enable=cfg.add_logic_value)
         else:
-            anchor_p = anchor_l = anchor_v = None  # type: ignore
-        
-        # Resolve gate types if needed (for embedding or loss)
-        # Note: We need them for loss anyway now.
+             anchor_p = anchor_l = anchor_v = solv_labels = None  # type: ignore
+
+        # Resolve gate types 
         gtypes = resolve_gate_types(node_ids, files, device)
-
-
 
         optim.zero_grad(set_to_none=True)
         
-        # AMP context
         with torch.amp.autocast('cuda', enabled=cfg.amp):
-            # Pass gate types to model if configured
-            logits = model(paths, masks, gate_types=gtypes if cfg.use_gate_type_embedding else None)  # [B, P, L, 2]
+            logits, solv_logits = model(paths, masks, gate_types=gtypes if cfg.use_gate_type_embedding else None)
 
-            loss, avg_reward, valid_rate, batch_edge_acc, batch_trivial = policy_loss_and_metrics(
+            loss, avg_reward, valid_rate, batch_edge_acc, batch_c_viol = policy_loss_and_metrics(
                 logits, node_ids, masks, files, gtypes,
+                constraint_mask=c_mask, constraint_vals=c_vals,
                 anchor_p=anchor_p, anchor_l=anchor_l, anchor_v=anchor_v,
+                solvability_logits=solv_logits, solvability_labels=solv_labels,
                 anchor_alpha=cfg.anchor_reward_alpha,
                 normalize_reward=cfg.normalize_reward,
                 entropy_beta=cfg.entropy_beta,
                 soft_edge_lambda=cfg.soft_edge_lambda,
             )
         
-        # Backprop (with scaler if AMP)
-        scaler.scale(loss).backward(retain_graph=True)
+        scaler.scale(loss).backward()
         scaler.step(optim)
         scaler.update()
 
@@ -845,64 +1004,47 @@ def train_one_epoch(model: nn.Module, loader: DataLoader, optim: torch.optim.Opt
         total_reward += float(avg_reward)
         total_valid += float(valid_rate)
         total_edge_acc += float(batch_edge_acc)
-        total_trivial += float(batch_trivial)
+        total_trivial += float(batch_c_viol) 
         total_batches += 1
-        # Periodic progress log
+        bdone += paths.size(0)
+        
         if cfg.verbose and cfg.log_interval > 0 and (batch_idx + 1) % cfg.log_interval == 0:
-            try:
-                total_len = len(loader)
-            except Exception:
-                total_len = -1
             elapsed = time.time() - start_time
-            bdone = batch_idx + 1
-            it_per_s = bdone / max(1e-6, elapsed)
-            # Prefer capped total for ETA if available
-            total_for_eta = target_batches if target_batches is not None else (total_len if total_len > 0 else None)
-            if total_for_eta is not None:
-                remaining = max(0, total_for_eta - bdone)
+            it_per_s = (batch_idx + 1) / max(1e-6, elapsed)
+            eta_str = ""
+            if target_batches is not None:
+                remaining = max(0, target_batches - (batch_idx + 1))
                 eta = _format_seconds(remaining / max(1e-6, it_per_s))
-                denom_str = f"/{total_for_eta}"
                 eta_str = f" eta={eta}"
-            else:
-                denom_str = ""
-                eta_str = ""
+            
             dbg = _debug_metrics_from_logits(
                 logits, node_ids, masks, files,
-                anchor_p=anchor_p if isinstance(anchor_p, torch.Tensor) else None,
-                anchor_l=anchor_l if isinstance(anchor_l, torch.Tensor) else None,
-                anchor_v=anchor_v if isinstance(anchor_v, torch.Tensor) else None,
+                anchor_p=anchor_p, anchor_l=anchor_l, anchor_v=anchor_v,
+                solvability_logits=solv_logits, solvability_labels=solv_labels,
             )
             print(
-                f"[train] batch {bdone}{denom_str} avg_loss={total_loss / max(1, total_batches):.4f} "
+                f"[train] batch {batch_idx+1} avg_loss={total_loss / max(1, total_batches):.4f} "
                 f"acc={total_valid / max(1, total_batches):.4f} edge_acc={dbg['edge_acc']:.3f} "
-                f"reconv={dbg['reconv_match_rate']:.3f} anchor={dbg['anchor_match_rate']:.3f} "
-                f"edges/sample={dbg['edges_per_sample']:.1f} speed={it_per_s:.2f} it/s{eta_str}"
+                f"solv_acc={dbg['solvability_acc']:.3f} false_unsat={dbg['false_unsat_rate']:.3f} "
+                f"anchor={dbg['anchor_match_rate']:.3f} speed={it_per_s:.2f} it/s{eta_str}"
             )
 
-        # Optional limit on number of batches per epoch
         if cfg.max_train_batches > 0 and (batch_idx + 1) >= cfg.max_train_batches:
             break
 
-    avg_loss = total_loss / max(1, total_batches)
-    avg_reward = total_reward / max(1, total_batches)
-    valid_rate = total_valid / max(1, total_batches)
-    avg_edge_acc = total_edge_acc / max(1, total_batches)
-    avg_trivial = total_trivial / max(1, total_batches)
-    # Return avg loss, avg reward, accuracy (valid rate), edge accuracy, trivial rate
-    return avg_loss, avg_reward, valid_rate, avg_edge_acc, avg_trivial
+    return (total_loss / max(1, total_batches), 
+            total_reward / max(1, total_batches), 
+            total_valid / max(1, total_batches), 
+            total_edge_acc / max(1, total_batches), 
+            total_trivial / max(1, total_batches))
 
 
 @torch.no_grad()
 def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, cfg: TrainConfig) -> Tuple[float, float, float, float, float]:
     model.eval()
-    total_loss = 0.0
-    total_reward = 0.0
-    total_valid = 0.0
-    total_edge_acc = 0.0
-    total_trivial = 0.0
-    total_batches = 0
+    total_loss, total_reward, total_valid, total_edge_acc, total_trivial, total_batches = 0.0, 0.0, 0.0, 0.0, 0.0, 0
     start_time = time.time()
-    # Target batch count for ETA (respect caps if provided)
+    
     try:
         loader_len = len(loader)
     except Exception:
@@ -917,101 +1059,80 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, cfg: Tr
         node_ids = batch['node_ids']
         files = batch['files']
         
-        # Resolve paths if bench_dir is provided
-        if cfg.bench_dir:
-            resolved_files = []
-            for f in files:
-                if os.path.exists(f):
-                    resolved_files.append(f)
-                else:
-                    joined = os.path.join(cfg.bench_dir, f)
-                    if os.path.exists(joined):
-                        resolved_files.append(joined)
-                    else:
-                        resolved_files.append(os.path.join(cfg.bench_dir, os.path.basename(f)))
-            files = resolved_files
         if device.type == 'cuda':
             paths = paths.to(device, non_blocking=True)
             masks = masks.to(device, non_blocking=True)
             node_ids = node_ids.to(device, non_blocking=True)
 
-        # Prefer dataset-provided anchors if available; else generate procedurally
-        if cfg.anchor_hint and 'anchor_p' in batch and 'anchor_l' in batch and 'anchor_v' in batch:
-            anchor_p = batch['anchor_p']
-            anchor_l = batch['anchor_l']
-            anchor_v = batch['anchor_v']
-            if device.type == 'cuda':
-                anchor_p = anchor_p.to(device, non_blocking=True)
-                anchor_l = anchor_l.to(device, non_blocking=True)
-                anchor_v = anchor_v.to(device, non_blocking=True)
-        elif cfg.anchor_hint:
-            anchor_p_cpu, anchor_l_cpu, anchor_v_cpu = _generate_anchor(node_ids.detach().cpu(), masks.detach().cpu(), files, cfg.prefer_value)
-            anchor_p = anchor_p_cpu.to(device)
-            anchor_l = anchor_l_cpu.to(device)
-            anchor_v = anchor_v_cpu.to(device)
+        c_prob = cfg.max_constraint_prob if cfg.constrained_curriculum else 0.0
+        c_mask, c_vals = generate_constraints(node_ids, files, c_prob)
+        
+        if cfg.add_logic_value and c_mask.any():
+            D = paths.shape[-1]
+            if D >= 3:
+                valid_mask = c_mask
+                if valid_mask.any():
+                    targets = c_vals[valid_mask]
+                    one_hot = torch.zeros((targets.shape[0], 3), device=device, dtype=paths.dtype)
+                    one_hot.scatter_(1, targets.unsqueeze(1), 1.0)
+                    paths_flat = paths.view(-1, D)
+                    mask_flat = valid_mask.view(-1)
+                    paths_flat[mask_flat, D-3:D] = one_hot
+
+        if cfg.anchor_hint:
+            ap_cpu, al_cpu, av_cpu, s_cpu = _generate_anchor(node_ids.detach().cpu(), masks.detach().cpu(), files, cfg.prefer_value)
+            anchor_p = ap_cpu.to(device)
+            anchor_l = al_cpu.to(device)
+            anchor_v = av_cpu.to(device)
+            solv_labels = s_cpu.to(device)
             paths = _inject_anchor_into_embeddings(paths, anchor_p, anchor_l, anchor_v, enable=cfg.add_logic_value)
         else:
-            anchor_p = anchor_l = anchor_v = None  # type: ignore
+            anchor_p = anchor_l = anchor_v = solv_labels = None  # type: ignore
 
         gtypes = resolve_gate_types(node_ids, files, device)
 
         with torch.amp.autocast('cuda', enabled=cfg.amp):
-            logits = model(paths, masks, gate_types=gtypes if cfg.use_gate_type_embedding else None)
-            loss, avg_reward, valid_rate, batch_edge_acc, batch_trivial = policy_loss_and_metrics(
+            logits, solv_logits = model(paths, masks, gate_types=gtypes if cfg.use_gate_type_embedding else None)
+            loss, avg_reward, valid_rate, batch_edge_acc, batch_c_viol = policy_loss_and_metrics(
                 logits, node_ids, masks, files, gtypes,
+                constraint_mask=c_mask, constraint_vals=c_vals,
                 anchor_p=anchor_p, anchor_l=anchor_l, anchor_v=anchor_v,
+                solvability_logits=solv_logits, solvability_labels=solv_labels,
                 anchor_alpha=cfg.anchor_reward_alpha,
                 normalize_reward=cfg.normalize_reward,
                 entropy_beta=cfg.entropy_beta,
                 soft_edge_lambda=cfg.soft_edge_lambda,
             )
+            
         total_loss += float(loss.item())
         total_reward += float(avg_reward)
         total_valid += float(valid_rate)
         total_edge_acc += float(batch_edge_acc)
-        total_trivial += float(batch_trivial)
+        total_trivial += float(batch_c_viol) 
         total_batches += 1
-        # Periodic progress log
+        
         if cfg.verbose and cfg.log_interval > 0 and (batch_idx + 1) % cfg.log_interval == 0:
-            try:
-                total_len = len(loader)
-            except Exception:
-                total_len = -1
             elapsed = time.time() - start_time
-            bdone = batch_idx + 1
-            it_per_s = bdone / max(1e-6, elapsed)
-            total_for_eta = target_batches if target_batches is not None else (total_len if total_len > 0 else None)
-            if total_for_eta is not None:
-                remaining = max(0, total_for_eta - bdone)
-                eta = _format_seconds(remaining / max(1e-6, it_per_s))
-                denom_str = f"/{total_for_eta}"
-                eta_str = f" eta={eta}"
-            else:
-                denom_str = ""
-                eta_str = ""
+            it_per_s = (batch_idx + 1) / max(1e-6, elapsed)
             dbg = _debug_metrics_from_logits(
                 logits, node_ids, masks, files,
-                anchor_p=anchor_p if isinstance(anchor_p, torch.Tensor) else None,
-                anchor_l=anchor_l if isinstance(anchor_l, torch.Tensor) else None,
-                anchor_v=anchor_v if isinstance(anchor_v, torch.Tensor) else None,
+                anchor_p=anchor_p, anchor_l=anchor_l, anchor_v=anchor_v,
+                solvability_logits=solv_logits, solvability_labels=solv_labels,
             )
             print(
-                f"[val] batch {bdone}{denom_str} avg_loss={total_loss / max(1, total_batches):.4f} "
+                f"[val] batch {batch_idx+1} avg_loss={total_loss / max(1, total_batches):.4f} "
                 f"acc={total_valid / max(1, total_batches):.4f} edge_acc={dbg['edge_acc']:.3f} "
-                f"reconv={dbg['reconv_match_rate']:.3f} anchor={dbg['anchor_match_rate']:.3f} "
-                f"edges/sample={dbg['edges_per_sample']:.1f} speed={it_per_s:.2f} it/s{eta_str}"
+                f"solv_acc={dbg['solvability_acc']:.3f} speed={it_per_s:.2f} it/s"
             )
 
-        # Optional limit on number of batches per evaluation
         if cfg.max_val_batches > 0 and (batch_idx + 1) >= cfg.max_val_batches:
             break
 
-    avg_loss = total_loss / max(1, total_batches)
-    avg_reward = total_reward / max(1, total_batches)
-    valid_rate = total_valid / max(1, total_batches)
-    avg_edge_acc = total_edge_acc / max(1, total_batches)
-    avg_trivial = total_trivial / max(1, total_batches)
-    return avg_loss, avg_reward, valid_rate, avg_edge_acc, avg_trivial
+    return (total_loss / max(1, total_batches), 
+            total_reward / max(1, total_batches), 
+            total_valid / max(1, total_batches), 
+            total_edge_acc / max(1, total_batches), 
+            total_trivial / max(1, total_batches))
 
 
 def save_checkpoint(path: str, model: nn.Module, cfg: TrainConfig, best: bool = False) -> None:
@@ -1048,6 +1169,8 @@ def cmd_train(args: argparse.Namespace) -> None:
         soft_edge_lambda=getattr(args, 'soft_edge_lambda', 1.0),
         max_len=getattr(args, 'max_len', 0),
         entropy_beta=getattr(args, 'entropy_beta', 0.0),
+        constrained_curriculum=getattr(args, 'constrained_curriculum', False),
+        max_constraint_prob=getattr(args, 'max_constraint_prob', 0.5),
     )
     
     # Handle checkpoint-dir alias
@@ -1105,12 +1228,12 @@ def cmd_train(args: argparse.Namespace) -> None:
         nb_val = len(val_loader) if hasattr(val_loader, '__len__') else 0
         print(f"Starting training: train_batches={nb_train}, val_batches={nb_val}, batch_size={cfg.batch_size}")
     for epoch in range(1, cfg.epochs + 1):
-        tr_loss, tr_reward, tr_acc, tr_edge, tr_triv = train_one_epoch(model, train_loader, optim, scaler, device, cfg)
-        va_loss, va_reward, va_acc, va_edge, va_triv = evaluate(model, val_loader, device, cfg)
+        tr_loss, tr_reward, tr_acc, tr_edge, tr_c_viol = train_one_epoch(model, train_loader, optim, scaler, device, cfg, epoch=epoch)
+        va_loss, va_reward, va_acc, va_edge, va_c_viol = evaluate(model, val_loader, device, cfg)
         print(
             f"Epoch {epoch:03d} | "
-            f"train_loss={tr_loss:.4f} avg_reward={tr_reward:.4f} acc={tr_acc:.4f} edge_acc={tr_edge:.4f} triv={tr_triv:.4f} | "
-            f"val_loss={va_loss:.4f} avg_reward={va_reward:.4f} acc={va_acc:.4f} edge_acc={va_edge:.4f} triv={va_triv:.4f}"
+            f"train_loss={tr_loss:.4f} avg_reward={tr_reward:.4f} acc={tr_acc:.4f} edge_acc={tr_edge:.4f} c_viol={tr_c_viol:.4f} | "
+            f"val_loss={va_loss:.4f} avg_reward={va_reward:.4f} acc={va_acc:.4f} edge_acc={va_edge:.4f} c_viol={va_c_viol:.4f}"
         )
 
         # Save periodic checkpoint
@@ -1135,12 +1258,16 @@ def build_argparser() -> argparse.ArgumentParser:
     t.add_argument('--amp', action='store_true', help='Enable Automatic Mixed Precision (AMP)')
     t.add_argument('--include-hard-negatives', action='store_true', help='Include hard negatives (currently ignored)')
     t.add_argument('--epochs', type=int, default=10)
+    t.add_argument('--constrained-curriculum', action='store_true', help='Enable constrained path training curriculum')
+    t.add_argument('--max-constraint-prob', type=float, default=0.5, help='Maximum probability of masking a constrained node')
+    
+
     t.add_argument('--batch-size', type=int, default=128)
     t.add_argument('--verbose', action='store_true')
     # Model capacity
     t.add_argument('--nhead', type=int, default=4, help='Number of attention heads')
-    t.add_argument('--enc-layers', type=int, default=1, help='Number of shared path encoder layers')
-    t.add_argument('--int-layers', type=int, default=1, help='Number of path interaction layers')
+    t.add_argument('--enc-layers', type=int, default=3, help='Number of shared path encoder layers')
+    t.add_argument('--int-layers', type=int, default=3, help='Number of path interaction layers')
     t.add_argument('--ffn-dim', type=int, default=512, help='Transformer feedforward dimension')
     t.add_argument('--model-dim', type=int, default=512, help='Internal Transformer model dimension (must be divisible by nhead)')
     t.add_argument('--add-logic-value', action='store_true', default=True, 
