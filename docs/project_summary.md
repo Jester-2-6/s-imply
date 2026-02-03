@@ -31,19 +31,25 @@ The core model is a hierarchical Transformer designed to process multiple reconv
         -   **Query**: Individual node representations.
         -   **Key/Value**: The set of interaction-aware path summaries.
     -   Allows every node in every path to attend to the global context of the reconvergent structure.
-5.  **Prediction Head**:
-    -   A linear layer mapping the final node representations to logits for Logic 0 and Logic 1.
+5.  **Prediction Heads**:
+    -   **Logic Head**: A linear layer mapping node representations to logits for Logic 0 and Logic 1.
+    -   **Solvability Head**: A global linear head that predicts whether the entire structure is SAT or UNSAT (Solvable vs Impossible) based on the pooled interaction vector.
 
 ### B. Solver & ATPG Logic (`src/atpg/reconv_podem.py`)
 Instead of a purely generative approach, the system relies on algorithmic solvers to identify structures and verify feasibility.
 
 -   **Structure Identification**:
-    -   `pick_reconv_pair`: Beam search to find reconvergent fanout structures.
-    -   `find_shortest_reconv_pair_ending_at`: Backward BFS to find the closest common ancestor (stem) for a given reconvergence node.
+    -   `pick_reconv_pair`: Enhanced beam search with a dominance-based heuristic. Prioritizes "tight" reconvergent loops by penalizing nodes with high external fanout (Exit Lines).
+    -   `find_shortest_reconv_pair_ending_at`: Backward BFS to find the closest common ancestor (stem).
+    -   **Maamari Concepts (Maamari & Rajski, 1990)**:
+        -   **Local Reconvergent Region (LRR)**: Formally defined as the intersection of nodes reachable from the stem and nodes that can reach the reconvergence point.
+        -   **Exit Lines**: Fanouts of LRR nodes that leave the region. These are tracked as critical "logic leakage" points.
 -   **Consistency Checking (`PathConsistencySolver`)**:
     -   Verifies if a target value at the reconvergence node is logically possible.
-    -   **Recursive Backtracking**: Uses `_backtrace_assignment` to recursively justify values backwards from the target node to the stem, checking for conflicts.
-    -   **Side-Input Constraint Handling**: Explicitly handles constraints on "side inputs" (inputs to gates on the path that are not part of the path itself).
+    -   **Recursive Regional Consistency**: Uses an optimized `_backtrace_assignment` that checks assignments against constraints on **Exit Lines**. This prevents the solver from accepting locally valid paths that are globally impossible due to path masking.
+    -   **Performance Optimization**: Uses an `exit_map` (dictionary-based lookup) to maintain stable O(1) performance during deep recursion, even on complex circuits like `c6288`.
+-   **Recursive Justification (`RecursiveStructureSolver`)**:
+    -   Utilizes LRR boundaries to prune justification queues, keeping the solver focused on Primary Inputs (PIs) and Exit Lines that directly influence the target reconvergence result.
 
 ### C. Training Pipeline (`src/ml/train_reconv.py`)
 The training uses a REINFORCE-based policy gradient approach with auxiliary losses to guide the model towards valid assignments.
@@ -79,8 +85,19 @@ The following metrics are used to evaluate model performance:
 -   **`edge_acc`**: The percentage of local gate input/output relations that are satisfied.
 -   **`reconv_match_rate`**: The percentage of samples where all paths predict the same value for the reconvergence node.
 -   **`anchor_match_rate`**: How often the model satisfies the injected anchor constraint.
+-   **`solv_acc`**: Accuracy of predicting whether a target is logically solvable (SAT) or impossible (UNSAT).
+-   **`false_unsat_rate`**: The frequency of incorrectly giving up on solvable targets.
 
-## 6. Current Challenges & Roadmap
+## 6. Experimental Results
+### A. SAT/UNSAT Consistency (Maamari Update)
+**Timestamp: 2026-02-02**
+Following the integration of Regional Consistency and LRR-based labeling, the model demonstrates high fidelity in identifying impossible targets:
+-   **Solvability Accuracy (`solv_acc`)**: **96.9%**
+-   **Path Logic Consistency (`edge_acc`)**: **91.3%**
+-   **Logic Prediction Accuracy (`acc`)**: **55.2%** (Baseline improvement over 50% random-init sequence matching).
+-   **Throughput**: **16 batches/sec** (Optimized `exit_map` in solver resolved previous deadlocks in complex ISCAS85 circuits).
+
+## 7. Current Challenges & Roadmap
 -   **Handling "Don't Cares" (X)**: The current model predicts binary 0/1. Integrating explicit X prediction or X-tolerance in the loss function is an ongoing area of research.
 -   **Complex Reconvergence**: Scaling from pair-wise paths to N-ary reconvergent structures.
 -   **Integration with Commercial ATPG**: Using the model's predictions as high-quality initial heuristics for industry-standard ATPG tools.

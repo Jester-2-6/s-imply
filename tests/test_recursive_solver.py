@@ -1,100 +1,196 @@
-import os
+
 import sys
-import random
-from typing import List, Dict, Any, Set
+import os
+
+# Add src to path
+sys.path.append(os.getcwd())
+
+import unittest
+from typing import List, Dict, Any
+
 from src.util.struct import Gate, GateType, LogicValue
-from src.util.io import parse_bench_file
-from src.atpg.reconv_podem import RecursiveStructureSolver
-from src.atpg.logic_sim_three import logic_sim, reset_gates
+from src.atpg.recursive_reconv_solver import HierarchicalReconvSolver, ReconvPairPredictor
+from src.atpg.reconv_podem import PathConsistencySolver
 
-def verify_assignment_sim(circuit: List[Gate], assignment: Dict[int, LogicValue], target_node: int, target_val: LogicValue) -> bool:
-    """
-    Verify assignment by simulating the circuit.
-    We set PIs from assignment, simulate, and check if target_node has target_val.
-    """
-    reset_gates(circuit, len(circuit)-1)
-    
-    # Apply PIs
-    for gid, val in assignment.items():
-        gate = circuit[gid]
-        if not gate.fin: # PI
-            gate.val = val
-        # Note: We only apply PIs. Internal gates should be computed.
-        # But if assignment contains internal gates, we ignore them for simulation inputs,
-        # but we can check if they match simulation results.
+class MockPredictor(ReconvPairPredictor):
+    def __init__(self, circuit, verbose=False):
+        self.circuit = circuit
+        self.solver = PathConsistencySolver(circuit)
+        self.verbose = verbose
+        self.call_log = []
+
+    def predict(self, pair_info, constraints):
+        if self.verbose:
+            print(f"Predict called for {pair_info['start']}->{pair_info['reconv']} with constraints {constraints}")
         
-    # Run simulation
-    logic_sim(circuit, len(circuit)-1)
-    
-    # Check target
-    if circuit[target_node].val != target_val:
-        # print(f"Mismatch at target {target_node}. Expected {target_val}, Got {circuit[target_node].val}")
-        return False
+        self.call_log.append(pair_info)
         
-    # Check consistency of all assigned internal nodes
-    for gid, val in assignment.items():
-        if circuit[gid].val != val and circuit[gid].val != LogicValue.XD:
-            # print(f"Mismatch at internal {gid}. Expected {val}, Got {circuit[gid].val}")
-            return False
-            
-    return True
-
-def test_recursive_solver():
-    bench_path = "data/bench/ISCAS85/c2670.bench"
-    if not os.path.exists(bench_path):
-        print(f"Error: {bench_path} not found.")
-        return
-
-    print(f"Loading {bench_path}...")
-    circuit, _ = parse_bench_file(bench_path)
-    
-    solver = RecursiveStructureSolver(circuit)
-    
-    # Pick 500 random nodes
-    # Filter for nodes that are not PIs (or include PIs? PIs are trivial)
-    # Let's pick internal gates.
-    candidates = [i for i, g in enumerate(circuit) if g.fin and g.type != GateType.INPT]
-    
-    if len(candidates) < 500:
-        test_nodes = candidates
-    else:
-        test_nodes = random.sample(candidates, 500)
+        # Use the actual solver to find ALL valid assignments for the reconvergent node
+        # But wait, PathConsistencySolver takes a TARGET value for R.
+        # HierarchicalReconvSolver doesn't pass a target value for R in Pair!
+        # It relies on constraints to implicitly set R or S.
         
-    print(f"Testing {len(test_nodes)} random nodes...")
-    
-    passed = 0
-    total_checks = 0
-    justified = 0
-    
-    for node in test_nodes:
-        for val in [LogicValue.ZERO, LogicValue.ONE]:
-            # Try to justify node=val
-            # print(f"Justifying Node {node} = {val}...")
-            assignment = solver.solve(node, val)
+        # If R is constrained, we solve for that value.
+        # If R is NOT constrained, we might need to try both 0 and 1?
+        # Or does the Recursion enforce R later?
+        # "Actual podem flow will start from a single gate... verified backwards"
+        # The target_node given to solve() is the root R. So R is constrained initially.
+        # For intermediate pairs, they must be part of the path to R.
+        
+        reconv_node = pair_info['reconv']
+        target_val = constraints.get(reconv_node, None)
+        
+        candidates = []
+        
+        possible_targets = [target_val] if target_val is not None else [LogicValue.ZERO, LogicValue.ONE]
+        
+        # Try to find MULTIPLE candidates by forcing the start node to different values
+        # This simulates a model returning a distribution of options.
+        start_node = pair_info['start']
+        possible_start_vals = [LogicValue.ZERO, LogicValue.ONE]
+        
+        # If start is already constrained, respect it
+        if start_node in constraints:
+            possible_start_vals = [constraints[start_node]]
             
-            total_checks += 1
+        seen_solutions = []
             
-            if assignment:
-                justified += 1
-                if verify_assignment_sim(circuit, assignment, node, val):
-                    passed += 1
-                else:
-                    print(f"FAIL: Node {node} Val {val} - Assignment verification failed.")
-            else:
-                # Impossible or solver failed.
-                # We can't easily distinguish without exhaustive search.
-                # But we count it as "not justified".
-                # print(f"Could not justify Node {node} = {val}")
-                pass
-                
-    print("\nRecursive Solver Results:")
-    print(f"Total Checks: {total_checks}")
-    print(f"Justified (Solution Found): {justified}")
-    print(f"Verified Correct: {passed}")
-    if justified > 0:
-        print(f"Accuracy (Verified/Justified): {passed/justified*100:.2f}%")
-    else:
-        print("Accuracy: N/A")
+        for s_val in possible_start_vals:
+            # Force start value in constraints passed to solver
+            # But we must not mutate the original constraints dict permanently for the loop
+            temp_constraints = constraints.copy()
+            temp_constraints[start_node] = s_val
+            
+            for t_val in possible_targets:
+                res = self.solver.solve(pair_info, t_val, temp_constraints)
+                if res:
+                    # Deduplicate based on content
+                    if res not in seen_solutions:
+                        candidates.append(res)
+                        seen_solutions.append(res)
+        
+        return candidates
 
-if __name__ == "__main__":
-    test_recursive_solver()
+class TestRecursiveSolver(unittest.TestCase):
+    def setUp(self):
+        # Construct a simple diamond circuit
+        # S(1) -> A(2), B(3) -> R(4) (AND)
+        self.circuit = [None] * 5
+        self.circuit[0] = Gate("dummy", GateType.INPT, 0, 0) # 0
+        self.circuit[1] = Gate("S", GateType.INPT, 0, 2)     # 1
+        self.circuit[2] = Gate("A", GateType.BUFF, 1, 1)     # 2
+        self.circuit[3] = Gate("B", GateType.NOT, 1, 1)      # 3
+        self.circuit[4] = Gate("R", GateType.AND, 2, 0)      # 4
+        
+        # Connections
+        self.circuit[1].fot = [2, 3]
+        
+        self.circuit[2].fin = [1]
+        self.circuit[2].fot = [4]
+        
+        self.circuit[3].fin = [1]
+        self.circuit[3].fot = [4]
+        
+        self.circuit[4].fin = [2, 3]
+
+    def test_solve_simple_diamond(self):
+        # S=0 -> A=0, B=1 -> R=0 (AND) -> Valid
+        # S=1 -> A=1, B=0 -> R=0 (AND) -> Valid
+        # Target: R=1 -> IMPOSSIBLE (A=1 and B=0 -> R=0)
+        
+        predictor = MockPredictor(self.circuit, verbose=True)
+        solver = HierarchicalReconvSolver(self.circuit, predictor)
+        
+        # Case 1: Target R=0
+        print("\n--- Test R=0 ---")
+        assignment = solver.solve(4, LogicValue.ZERO)
+        print("Assignment:", assignment)
+        self.assertIsNotNone(assignment)
+        self.assertEqual(assignment[4], LogicValue.ZERO)
+        # Check inputs: if S is assigned, check logic
+        if 1 in assignment:
+            s_val = assignment[1]
+            # S=0 or S=1 are both valid for R=0
+            pass
+            
+        # Case 2: Target R=1 (Impossible)
+        print("\n--- Test R=1 ---")
+        assignment = solver.solve(4, LogicValue.ONE)
+        print("Assignment:", assignment)
+        self.assertIsNone(assignment)
+
+    def test_nested_diamond(self):
+        # S1(1) -> [S2(2), A(3)]
+        # S2(2) -> [B(4), C(5)] -> R1(6) (OR)
+        # R1(6) -> D(7)
+        # A(3) -> E(8) 
+        # D(7), E(8) -> R2(9) (AND)
+        
+        # Pairs:
+        # Inner: S2 -> R1 (Short)
+        # Outer: S1 -> R2 (Long)
+        
+        circuit = [None] * 10
+        circuit[0] = Gate("dummy", GateType.INPT)
+        circuit[1] = Gate("S1", GateType.INPT, 0, 2)
+        circuit[2] = Gate("S2", GateType.BUFF, 1, 2) # S2 fed by S1
+        circuit[3] = Gate("A", GateType.BUFF, 1, 1)  # A fed by S1
+        
+        circuit[4] = Gate("B", GateType.BUFF, 1, 1) # B fed by S2
+        circuit[5] = Gate("C", GateType.NOT, 1, 1)  # C fed by S2
+        circuit[6] = Gate("R1", GateType.OR, 2, 1)  # R1 fed by B, C
+        
+        circuit[7] = Gate("D", GateType.BUFF, 1, 1) # D fed by R1
+        circuit[8] = Gate("E", GateType.BUFF, 1, 1) # E fed by A
+        circuit[9] = Gate("R2", GateType.AND, 2, 0) # R2 fed by D, E
+        
+        # Connections
+        circuit[1].fot = [2, 3]
+        
+        circuit[2].fin = [1]; circuit[2].fot = [4, 5]
+        circuit[3].fin = [1]; circuit[3].fot = [8]
+        
+        circuit[4].fin = [2]; circuit[4].fot = [6]
+        circuit[5].fin = [2]; circuit[5].fot = [6]
+        
+        circuit[6].fin = [4, 5]; circuit[6].fot = [7]
+        
+        circuit[7].fin = [6]; circuit[7].fot = [9]
+        circuit[8].fin = [3]; circuit[8].fot = [9]
+        
+        circuit[9].fin = [7, 8]
+        
+        # Logic: 
+        # S2 = S1
+        # R1 = B | C = S2 | ~S2 = 1 (Always 1)
+        # D = R1 = 1
+        # E = A = S1
+        # R2 = D & E = 1 & S1 = S1
+        
+        # So R2=1 requires S1=1.
+        # R2=0 requires S1=0.
+        
+        # Also, R1 should always be 1.
+        
+        predictor = MockPredictor(circuit, verbose=True)
+        solver = HierarchicalReconvSolver(circuit, predictor)
+        
+        print("\n--- Test Nested R2=1 ---")
+        assignment = solver.solve(9, LogicValue.ONE)
+        
+        # Verify order of calls
+        # Should solve inner pair (S2->R1) before outer pair (S1->R2)
+        # Inner paths sum len: (S2-B-R1) + (S2-C-R1) = 3 + 3 = 6
+        # Outer paths sum len: (S1-S2-R1-D-R2) + (S1-A-E-R2) = 5 + 4 = 9
+        
+        print("Call Log:", [(p['start'], p['reconv']) for p in predictor.call_log])
+        
+        self.assertEqual(predictor.call_log[0]['start'], 2) # S2
+        self.assertEqual(predictor.call_log[0]['reconv'], 6) # R1
+        
+        self.assertIsNotNone(assignment)
+        self.assertEqual(assignment[9], LogicValue.ONE)
+        self.assertEqual(assignment[1], LogicValue.ONE)
+
+if __name__ == '__main__':
+    unittest.main()

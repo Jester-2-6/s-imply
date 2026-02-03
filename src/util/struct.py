@@ -61,3 +61,10 @@ class Gate:
 
     def __repr__(self):
         return self.__str__()
+
+class Fault:
+    def __init__(self, gate_id: int, value: int):
+        self.gate_id = gate_id
+        self.value = value
+    def __repr__(self):
+        return f"Fault(gate_id={self.gate_id}, value={self.value})"
