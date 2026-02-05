@@ -26,6 +26,7 @@ from dataclasses import dataclass, asdict
 from functools import lru_cache
 from typing import Tuple
 import time
+from tqdm import tqdm
 
 import torch
 from torch import nn
@@ -84,13 +85,21 @@ class TrainConfig:
     constrained_curriculum: bool = False
     max_constraint_prob: float = 0.5
     enforce_constraints: bool = True
+    processed_dir: Optional[str] = None
 
 
 def make_dataloaders(cfg: TrainConfig, device: torch.device) -> Tuple[DataLoader, DataLoader]:
-    # Auto-detect processed shards: look for processed/ subdirectory next to dataset
-    dataset_dir = os.path.dirname(cfg.dataset)
-    processed_dir = os.path.join(dataset_dir, 'reconv_processed')
-    load_processed = os.path.isdir(processed_dir)
+    # Use config processed_dir if provided, else auto-detect
+    if cfg.processed_dir:
+        processed_dir = cfg.processed_dir
+        load_processed = os.path.isdir(processed_dir)
+        if not load_processed:
+            print(f"[WARNING] Processed dir {processed_dir} not found. Falling back to raw pickle.")
+    else:
+        # Auto-detect processed shards: look for processed/ subdirectory next to dataset
+        dataset_dir = os.path.dirname(cfg.dataset)
+        processed_dir = os.path.join(dataset_dir, 'reconv_processed')
+        load_processed = os.path.isdir(processed_dir)
     
     # For best throughput, keep dataset tensors on CPU and move whole batches to GPU
     dataset_device = torch.device('cpu') if device.type == 'cuda' else device
@@ -136,7 +145,7 @@ def make_dataloaders(cfg: TrainConfig, device: torch.device) -> Tuple[DataLoader
     return train_loader, val_loader
 
 
-@lru_cache(maxsize=64)
+@lru_cache(maxsize=32)
 def _load_circuit(bench_file: str):
     circuit, _ = parse_bench_file(bench_file)
     return circuit
@@ -518,7 +527,15 @@ def generate_constraints(
     if prob <= 0.0:
         return constraint_mask, constraint_vals
 
-    for b in range(B):
+    # Subsampling optimization: only simulate a subset of the batch
+    # This prevents the main thread from blocking for too long.
+    max_samples = 16
+    indices = torch.randperm(B)[:max_samples].tolist()
+    
+    # for b in range(B): # OLD: simulate all
+    for b in indices:
+        # if b % 10 == 0:
+        #      print(f"[Constraint Gen] Simulating {files[b]} ({b+1}/{B})")
         circuit = _load_circuit(files[b])
         # Reset and Simulate with random inputs
         reset_gates(circuit, len(circuit)-1)
@@ -879,6 +896,10 @@ def policy_loss_and_metrics(
             
     reward = torch.clamp(reward, min=-1.0, max=1.0)
 
+    # Calculate avg_reward BEFORE normalization for logging
+    with torch.no_grad():
+        raw_avg_reward = float(reward.mean().item())
+
     # Optional per-batch normalization
     if normalize_reward:
         mean_r = reward.mean()
@@ -921,7 +942,7 @@ def policy_loss_and_metrics(
 
     # Recompute metrics for logging
     with torch.no_grad():
-        avg_reward = float(reward.mean().item()) # Using adjusted reward
+        avg_reward = raw_avg_reward # Log the raw reward
         
         # Valid = local OK & reconv OK & non-trivial
         trivial = (checked == 0)
@@ -959,16 +980,23 @@ def train_one_epoch(model: nn.Module, loader: DataLoader, optim: torch.optim.Opt
     if cfg.max_train_batches > 0:
         target_batches = cfg.max_train_batches if target_batches is None else min(cfg.max_train_batches, target_batches)
 
-    # Curriculum for constraints
+    # Curriculum: Phase 1 (0-50%) = Pure Learning (No Constraints)
+    #             Phase 2 (50%-100%) = Linear Ramp (0 -> Max Constraints)
     constraint_prob = 0.0
     if cfg.constrained_curriculum and cfg.epochs > 0:
-        progress = epoch / cfg.epochs
-        constraint_prob = cfg.max_constraint_prob * progress
+        half_epochs = cfg.epochs // 2
+        if epoch <= half_epochs:
+            constraint_prob = 0.0
+        else:
+            # Progress within Phase 2 (0.0 to 1.0)
+            phase2_progress = (epoch - half_epochs) / (cfg.epochs - half_epochs)
+            constraint_prob = cfg.max_constraint_prob * phase2_progress
         
     if cfg.verbose:
-        print(f"[curriculum] epoch={epoch} constraint_prob={constraint_prob:.3f}")
+        print(f"[curriculum] epoch={epoch} constraint_prob={constraint_prob:.3f} (Phase {'1' if epoch <= cfg.epochs//2 else '2'})")
 
-    for batch_idx, batch in enumerate(loader):
+    pbar = tqdm(loader, desc=f"Epoch {epoch}", total=target_batches, disable=not cfg.verbose)
+    for batch_idx, batch in enumerate(pbar):
         paths = batch['paths_emb']
         masks = batch['attn_mask']
         node_ids = batch['node_ids']
@@ -979,25 +1007,45 @@ def train_one_epoch(model: nn.Module, loader: DataLoader, optim: torch.optim.Opt
             masks = masks.to(device, non_blocking=True)
             node_ids = node_ids.to(device, non_blocking=True)
 
+        # Initialize Logic Value Vector to "Unknown" [0, 0, 1] if enabled
+        if cfg.add_logic_value:
+            B_cur, P_cur, L_cur, D_cur = paths.shape
+            if D_cur >= 3:
+                # Optimized: set X bit (index 2) to 1, others to 0
+                paths[..., D_cur-3:D_cur-1] = 0.0
+                paths[..., D_cur-1] = 1.0
+
         # Generate Constraints
         c_prob = constraint_prob
         c_mask, c_vals = generate_constraints(node_ids, files, prob=c_prob)
 
         # Inject constraints into embeddings
-        if cfg.add_logic_value and c_mask.any():
-            D = paths.shape[-1]
-            if D >= 3:
-                valid_mask = c_mask
-                if valid_mask.any():
-                    targets = c_vals[valid_mask]
-                    one_hot = torch.zeros((targets.shape[0], 3), device=device, dtype=paths.dtype)
-                    one_hot.scatter_(1, targets.unsqueeze(1), 1.0)
-                    paths_flat = paths.view(-1, D)
-                    mask_flat = valid_mask.view(-1)
-                    paths_flat[mask_flat, D-3:D] = one_hot
+        if cfg.add_logic_value:
+            # We always check for constraints but only inject if mask is present
+            if c_mask.any():
+                D = paths.shape[-1]
+                if D >= 3:
+                    valid_mask = c_mask
+                    if valid_mask.any():
+                        targets = c_vals[valid_mask]
+                        one_hot = torch.zeros((targets.shape[0], 3), device=device, dtype=paths.dtype)
+                        one_hot.scatter_(1, targets.unsqueeze(1), 1.0)
+                        paths_flat = paths.view(-1, D)
+                        mask_flat = valid_mask.view(-1)
+                        paths_flat[mask_flat, D-3:D] = one_hot
 
-        # Anchors and Solvability
-        if cfg.anchor_hint:
+        # Try to use anchors provided by the dataset (parallelized in workers)
+        if 'anchor_p' in batch and batch['anchor_p'] is not None and 'solvability' in batch:
+             anchor_p = batch['anchor_p'].to(device)
+             anchor_l = batch['anchor_l'].to(device)
+             anchor_v = batch['anchor_v'].to(device)
+             solv_labels = batch['solvability'].to(device)
+             # Inject into embeddings if enabled
+             if cfg.add_logic_value:
+                  paths = _inject_anchor_into_embeddings(paths, anchor_p, anchor_l, anchor_v, enable=True)
+                  
+        elif cfg.anchor_hint:
+             # Fallback to main-thread generation (slow)
              ap_cpu, al_cpu, av_cpu, s_cpu = _generate_anchor(node_ids.detach().cpu(), masks.detach().cpu(), files, cfg.prefer_value)
              anchor_p = ap_cpu.to(device)
              anchor_l = al_cpu.to(device)
@@ -1039,25 +1087,17 @@ def train_one_epoch(model: nn.Module, loader: DataLoader, optim: torch.optim.Opt
         bdone += paths.size(0)
         
         if cfg.verbose and cfg.log_interval > 0 and (batch_idx + 1) % cfg.log_interval == 0:
-            elapsed = time.time() - start_time
-            it_per_s = (batch_idx + 1) / max(1e-6, elapsed)
-            eta_str = ""
-            if target_batches is not None:
-                remaining = max(0, target_batches - (batch_idx + 1))
-                eta = _format_seconds(remaining / max(1e-6, it_per_s))
-                eta_str = f" eta={eta}"
-            
             dbg = _debug_metrics_from_logits(
                 logits, node_ids, masks, files,
                 anchor_p=anchor_p, anchor_l=anchor_l, anchor_v=anchor_v,
                 solvability_logits=solv_logits, solvability_labels=solv_labels,
             )
-            print(
-                f"[train] batch {batch_idx+1} avg_loss={total_loss / max(1, total_batches):.4f} "
-                f"acc={total_valid / max(1, total_batches):.4f} edge_acc={dbg['edge_acc']:.3f} "
-                f"solv_acc={dbg['solvability_acc']:.3f} false_unsat={dbg['false_unsat_rate']:.3f} "
-                f"anchor={dbg['anchor_match_rate']:.3f} speed={it_per_s:.2f} it/s{eta_str}"
-            )
+            pbar.set_postfix({
+                'loss': f"{total_loss / max(1, total_batches):.4f}",
+                'acc': f"{total_valid / max(1, total_batches):.4f}",
+                'solv': f"{dbg['solvability_acc']:.3f}",
+                'edge': f"{dbg['edge_acc']:.3f}"
+            })
 
         if cfg.max_train_batches > 0 and (batch_idx + 1) >= cfg.max_train_batches:
             break
@@ -1083,7 +1123,8 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, cfg: Tr
     if cfg.max_val_batches > 0:
         target_batches = cfg.max_val_batches if target_batches is None else min(cfg.max_val_batches, target_batches)
 
-    for batch_idx, batch in enumerate(loader):
+    pbar = tqdm(loader, desc="Eval", total=target_batches, disable=not cfg.verbose)
+    for batch_idx, batch in enumerate(pbar):
         paths = batch['paths_emb']
         masks = batch['attn_mask']
         node_ids = batch['node_ids']
@@ -1201,6 +1242,7 @@ def cmd_train(args: argparse.Namespace) -> None:
         entropy_beta=getattr(args, 'entropy_beta', 0.0),
         constrained_curriculum=getattr(args, 'constrained_curriculum', False),
         max_constraint_prob=getattr(args, 'max_constraint_prob', 0.5),
+        processed_dir=getattr(args, 'processed_dir', None),
     )
     
     # Handle checkpoint-dir alias
@@ -1282,6 +1324,7 @@ def build_argparser() -> argparse.ArgumentParser:
 
     t = sub.add_parser('train', help='Run supervised training')
     t.add_argument('--dataset', type=str, default='data/datasets/reconv_dataset.pkl', help='Path to dataset .pkl')
+    t.add_argument('--processed-dir', type=str, help='Directory containing pre-processed shard_*.pt files')
     t.add_argument('--output', type=str, default='checkpoints/reconv_minimal', help='Output checkpoint directory')
     t.add_argument('--checkpoint-dir', type=str, help='Output checkpoint directory (alias for --output)')
     t.add_argument('--bench-dir', type=str, default='', help='Base directory for benchmark files')

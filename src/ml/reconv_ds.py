@@ -14,8 +14,10 @@ from functools import lru_cache
 
 import torch
 from torch.utils.data import Dataset
+from tqdm import tqdm
 from src.util.io import parse_bench_file
 from src.util.struct import GateType
+from src.atpg.reconv_podem import PathConsistencySolver, LogicValue
 
 
 class ReconvergentPathsDataset(Dataset):
@@ -79,15 +81,9 @@ class ReconvergentPathsDataset(Dataset):
                 [os.path.join(self.processed_dir, f) for f in os.listdir(self.processed_dir) if f.startswith('shard_') and f.endswith('.pt')]
             )
             if shard_paths:
-                # Lightweight probe to get sizes without loading all tensors
-                for sp in shard_paths:
-                    meta = torch.load(sp, map_location='cpu')
-                    n = int(meta['paths_emb'].shape[0])
-                    self._shard_files.append(sp)
-                    self._shard_sizes.append(n)
+                self._load_all_shards(shard_paths)
                 self._use_processed = True
-                self._total_len = sum(self._shard_sizes)
-                print(f"Loaded processed shards from {self.processed_dir} ({len(self._shard_files)} shards, {self._total_len} samples)")
+                print(f"Loaded ALL processed shards into RAM ({len(shard_paths)} shards, {self._total_len} samples)")
             else:
                 self._use_processed = False
         else:
@@ -135,18 +131,49 @@ class ReconvergentPathsDataset(Dataset):
         circuit, _ = parse_bench_file(bench_file)
         return circuit
 
-    @staticmethod
-    def _compatible_anchor_value(gate_type: int, prefer_value: int) -> int:
-        # Heuristic mapping (non-controlling bias)
-        if gate_type == GateType.AND or gate_type == GateType.NAND:
-            return 1
-        if gate_type == GateType.OR or gate_type == GateType.NOR:
-            return 0
-        return int(prefer_value)
+    def _load_all_shards(self, shard_paths: List[str]):
+        """Load all shards and concatenate them into memory."""
+        all_paths_emb = []
+        all_attn_mask = []
+        all_node_ids = []
+        all_files = []
+        all_anchor_p = []
+        all_anchor_l = []
+        all_anchor_v = []
+        all_solvability = []
+        
+        print("Loading all shards into RAM (prevent thrashing)...")
+        for i, sp in enumerate(tqdm(shard_paths, desc="Loading Shards")):
+            data = torch.load(sp, map_location='cpu')
+            all_paths_emb.append(data['paths_emb'])
+            all_attn_mask.append(data['attn_mask'])
+            all_node_ids.append(data['node_ids'])
+            all_files.extend(data['files'])
+            
+            if 'anchor_p' in data and data['anchor_p'] is not None:
+                all_anchor_p.append(data['anchor_p'])
+                all_anchor_l.append(data['anchor_l'])
+                all_anchor_v.append(data['anchor_v'])
+                all_solvability.append(data['solvability'])
+        
+        self.mem_paths_emb = torch.cat(all_paths_emb, dim=0)
+        self.mem_attn_mask = torch.cat(all_attn_mask, dim=0)
+        self.mem_node_ids = torch.cat(all_node_ids, dim=0)
+        self.mem_files = all_files
+        self._total_len = self.mem_paths_emb.shape[0]
+        
+        if all_anchor_p:
+            self.mem_anchor_p = torch.cat(all_anchor_p, dim=0)
+            self.mem_anchor_l = torch.cat(all_anchor_l, dim=0)
+            self.mem_anchor_v = torch.cat(all_anchor_v, dim=0)
+            self.mem_solvability = torch.cat(all_solvability, dim=0)
+            self.mem_has_anchors = True
+        else:
+            self.mem_has_anchors = False
 
-    def _gen_anchor_for_sample(self, node_ids: torch.Tensor, attn_mask: torch.Tensor, file_path: str) -> Tuple[int, int, int]:
-        """Pick a random path that has any valid nodes, take its last node,
-        and compute a compatible anchor value. Returns (p, l, v) or (-1,-1,0)."""
+    def _gen_anchor_for_sample(self, node_ids: torch.Tensor, attn_mask: torch.Tensor, file_path: str, pair_info: Dict[str, Any]) -> Tuple[int, int, int, int]:
+        """Pick a random path/gate, pick value, and check solvability.
+        Returns (p, l, v, solvability). solvability=1 means UNSAT."""
         P, L = node_ids.shape[:2]
         candidates: List[Tuple[int, int, int]] = []  # (p, last_idx, gate_type)
         circuit = self._load_circuit_cached(file_path)
@@ -159,11 +186,20 @@ class ReconvergentPathsDataset(Dataset):
                     gty = int(circuit[cur_id].type)
                     candidates.append((p, last_idx, gty))
         if not candidates:
-            return -1, -1, 0
+            return -1, -1, 0, 0
+            
         pick = torch.randint(low=0, high=len(candidates), size=(1,)).item()
         p_sel, l_sel, g_sel = candidates[int(pick)]
         v_sel = self._compatible_anchor_value(g_sel, self._prefer_value)
-        return int(p_sel), int(l_sel), int(v_sel)
+        
+        # Check solvability
+        solver = PathConsistencySolver(circuit)
+        target_lv = LogicValue.ZERO if v_sel == 0 else LogicValue.ONE
+        assignment = solver.solve(pair_info, target_lv)
+        is_unsat = 1 if assignment is None else 0
+        
+        return int(p_sel), int(l_sel), int(v_sel), int(is_unsat)
+
     
     def __len__(self) -> int:
         if getattr(self, '_use_processed', False):
@@ -171,36 +207,30 @@ class ReconvergentPathsDataset(Dataset):
         return len(self.data)
     
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        """Get a single dataset item.
-        
-        Returns
-        -------
-        dict
-            Dictionary with keys:
-            - paths_emb: [P, L, D] embeddings for each node in each path
-            - attn_mask: [P, L] boolean mask (True = valid position)
-            - node_ids: [P, L] node IDs for each position
-            - file: circuit file path
-        """
+        """Get a single dataset item."""
         # Fast path: load from preprocessed shards
         if getattr(self, '_use_processed', False):
-            shard_id, local_idx = self._locate_shard(idx)
-            self._ensure_shard_loaded(shard_id)
-            assert self._current_shard is not None
-            paths_emb = self._current_shard['paths_emb'][local_idx].to(torch.float32).to(self.device)
-            attn_mask = self._current_shard['attn_mask'][local_idx].to(self.device)
-            node_ids = self._current_shard['node_ids'][local_idx].to(self.device)
-            file_path = self._current_shard['files'][local_idx]
+            # In-memory fast path
+            paths_emb = self.mem_paths_emb[idx].to(torch.float32).to(self.device)
+            attn_mask = self.mem_attn_mask[idx].to(self.device)
+            node_ids = self.mem_node_ids[idx].to(self.device)
+            file_path = self.mem_files[idx]
+            
             # Optionally integrate anchor hint at dataset level
-            if self.anchor_in_dataset:
-                p_sel, l_sel, v_sel = self._gen_anchor_for_sample(node_ids, attn_mask, file_path)
-                if p_sel >= 0 and l_sel >= 0 and self.add_logic_value and paths_emb.shape[-1] >= 3:
+            if self.anchor_in_dataset and getattr(self, 'mem_has_anchors', False):
+                 p_sel = int(self.mem_anchor_p[idx].item())
+                 l_sel = int(self.mem_anchor_l[idx].item())
+                 v_sel = int(self.mem_anchor_v[idx].item())
+                 s_sel = int(self.mem_solvability[idx].item())
+                 
+                 if p_sel >= 0 and l_sel >= 0 and self.add_logic_value and paths_emb.shape[-1] >= 3:
                     D = paths_emb.shape[-1]
                     onehot = torch.tensor([1.0, 0.0, 0.0], device=self.device)
                     if v_sel == 1:
                         onehot = torch.tensor([0.0, 1.0, 0.0], device=self.device)
                     paths_emb[p_sel, l_sel, D-3:D] = onehot
-                return {
+                    
+                 return {
                     'paths_emb': paths_emb,
                     'attn_mask': attn_mask,
                     'node_ids': node_ids,
@@ -208,14 +238,15 @@ class ReconvergentPathsDataset(Dataset):
                     'anchor_p': torch.tensor(p_sel, dtype=torch.long, device=self.device),
                     'anchor_l': torch.tensor(l_sel, dtype=torch.long, device=self.device),
                     'anchor_v': torch.tensor(v_sel, dtype=torch.long, device=self.device),
-                }
+                    'solvability': torch.tensor(s_sel, dtype=torch.long, device=self.device),
+                 }
             else:
-                return {
+                 return {
                     'paths_emb': paths_emb,
                     'attn_mask': attn_mask,
                     'node_ids': node_ids,
                     'file': file_path,
-                }
+                 }
 
         entry = self.data[idx]
         
@@ -307,7 +338,7 @@ class ReconvergentPathsDataset(Dataset):
         
         # Optionally integrate anchor hint at dataset level
         if self.anchor_in_dataset:
-            p_sel, l_sel, v_sel = self._gen_anchor_for_sample(node_ids, attn_mask, file_path)
+            p_sel, l_sel, v_sel, s_sel = self._gen_anchor_for_sample(node_ids, attn_mask, file_path, info)
             if p_sel >= 0 and l_sel >= 0 and self.add_logic_value and paths_emb.shape[-1] >= 3:
                 D = paths_emb.shape[-1]
                 onehot = torch.tensor([1.0, 0.0, 0.0], device=self.device)
@@ -322,6 +353,7 @@ class ReconvergentPathsDataset(Dataset):
                 'anchor_p': torch.tensor(p_sel, dtype=torch.long, device=self.device),
                 'anchor_l': torch.tensor(l_sel, dtype=torch.long, device=self.device),
                 'anchor_v': torch.tensor(v_sel, dtype=torch.long, device=self.device),
+                'solvability': torch.tensor(s_sel, dtype=torch.long, device=self.device),
             }
         else:
             return {
@@ -382,13 +414,21 @@ class ReconvergentPathsDataset(Dataset):
 
         total = len(raw_ds)
         shard_idx = 0
+        
         buf_paths: List[torch.Tensor] = []
         buf_masks: List[torch.Tensor] = []
         buf_nodes: List[torch.Tensor] = []
         buf_files: List[str] = []
+        
+        # Buffers for new fields
+        buf_ap: List[torch.Tensor] = []
+        buf_al: List[torch.Tensor] = []
+        buf_av: List[torch.Tensor] = []
+        buf_solv: List[torch.Tensor] = []
 
         def flush() -> None:
             nonlocal shard_idx, buf_paths, buf_masks, buf_nodes, buf_files
+            nonlocal buf_ap, buf_al, buf_av, buf_solv
             if not buf_paths:
                 return
             # Final safety: ensure equal shapes before stacking
@@ -401,24 +441,78 @@ class ReconvergentPathsDataset(Dataset):
             paths_t = torch.stack(buf_paths, dim=0).to(dtype)
             masks_t = torch.stack(buf_masks, dim=0)
             nodes_t = torch.stack(buf_nodes, dim=0)
+            
+            # Stack anchor fields
+            ap_t = torch.tensor(buf_ap, dtype=torch.long)
+            al_t = torch.tensor(buf_al, dtype=torch.long)
+            av_t = torch.tensor(buf_av, dtype=torch.long)
+            sv_t = torch.tensor(buf_solv, dtype=torch.long)
+
             shard = {
                 'paths_emb': paths_t.cpu(),
                 'attn_mask': masks_t.cpu(),
                 'node_ids': nodes_t.cpu(),
                 'files': list(buf_files),
+                'anchor_p': ap_t.cpu(),
+                'anchor_l': al_t.cpu(),
+                'anchor_v': av_t.cpu(),
+                'solvability': sv_t.cpu(),
             }
             out_path = os.path.join(output_dir, f'shard_{shard_idx:05d}.pt')
             torch.save(shard, out_path)
             print(f"Wrote {out_path} ({paths_t.shape[0]} samples)")
             shard_idx += 1
             buf_paths, buf_masks, buf_nodes, buf_files = [], [], [], []
+            buf_ap, buf_al, buf_av, buf_solv = [], [], [], []
 
         for i in range(total):
-            item = raw_ds[i]
-            pe = item['paths_emb'].to(torch.float32).cpu()
-            am = item['attn_mask'].cpu()
-            ni = item['node_ids'].cpu()
-            # Pad to fixed max_path_length for consistent stacking
+            item = raw_ds.data[i] # Access raw data to avoid overhead of __getitem__ logic
+            # But we need the embeddings which __getitem__ prepares... 
+            # Actually __getitem__ of raw_ds (load_processed=False) does standard loading.
+            # Let's use raw_ds[i] but disable anchor generation in it to avoid double work?
+            # We want to force anchor generation here.
+            # So, set raw_ds.anchor_in_dataset = False temporarily, and call _gen_anchor manually.
+            
+            # Access raw dict directly for speed if possible, but we need tensor padding logic.
+            # It's cleaner to reuse __getitem__ but handling anchors is tricky if we want to save them.
+            # Let's assume we call _gen_anchor_for_sample here manually.
+            
+            # Load basic tensors
+            # We can't use raw_ds[i] accurately if we want efficient access to underlying structures without overhead.
+            # Replicating logic from lines 418-440:
+            
+            # Recalculate what we need
+            entry = raw_ds.data[i]
+            file_path = entry['file']
+            info = entry['info']
+            
+            # Use raw_ds helper to get Tensors
+            sample = raw_ds[i] # This handles padding/embedding
+            pe = sample['paths_emb'].to(torch.float32).cpu()
+            am = sample['attn_mask'].cpu()
+            ni = sample['node_ids'].cpu()
+
+            # Pad TO fixed size (logic duplicated from original code, but we reuse the result from __getitem__ if max_path_length matches)
+            # original code padded manually. Let's trust raw_ds[i] returns padded if we set max_path_length correctly?
+            # Actually raw_ds[i] pads to self.max_path_length.
+            
+            # GENERATE ANCHOR
+            # construct info for solver
+            # info is available in entry['info']
+            p_sel, l_sel, v_sel, s_sel = raw_ds._gen_anchor_for_sample(ni, am, file_path, info)
+            
+            # If valid, we might inject into embedding? 
+            # Ideally we save the "clean" embedding and inject at runtime?
+            # Or inject now? If we inject now, we bake in the anchor.
+            # Baking in is faster.
+            if p_sel >= 0 and l_sel >= 0 and raw_ds.add_logic_value and pe.shape[-1] >= 3:
+                D = pe.shape[-1]
+                onehot = torch.tensor([1.0, 0.0, 0.0])
+                if v_sel == 1:
+                    onehot = torch.tensor([0.0, 1.0, 0.0])
+                pe[p_sel, l_sel, D-3:D] = onehot
+
+            # Pad strictly to max_path_length for stacking
             Pdim, Lcur, Ddim = pe.shape
             Lfix = max_path_length
             if Lcur < Lfix:
@@ -434,15 +528,16 @@ class ReconvergentPathsDataset(Dataset):
                 am = am[:, :Lfix]
                 ni = ni[:, :Lfix]
 
-            # Assert shapes are consistent now
-            assert pe.shape[1] == max_path_length, f"pe length {pe.shape[1]} != {max_path_length}"
-            assert am.shape[1] == max_path_length, f"am length {am.shape[1]} != {max_path_length}"
-            assert ni.shape[1] == max_path_length, f"ni length {ni.shape[1]} != {max_path_length}"
-
             buf_paths.append(pe)
             buf_masks.append(am)
             buf_nodes.append(ni)
-            buf_files.append(item['file'])
+            buf_files.append(file_path)
+            
+            buf_ap.append(int(p_sel))
+            buf_al.append(int(l_sel))
+            buf_av.append(int(v_sel))
+            buf_solv.append(int(s_sel))
+            
             if len(buf_paths) >= shard_size:
                 flush()
         flush()
@@ -536,11 +631,13 @@ def reconv_collate(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         'files': files,
     }
     # Collate optional anchors if present
-    if 'anchor_p' in batch[0] and 'anchor_l' in batch[0] and 'anchor_v' in batch[0]:
+    if 'anchor_p' in batch[0] and 'anchor_l' in batch[0] and 'anchor_v' in batch[0] and 'solvability' in batch[0]:
         ap = torch.stack([item['anchor_p'] for item in batch], dim=0)
         al = torch.stack([item['anchor_l'] for item in batch], dim=0)
         av = torch.stack([item['anchor_v'] for item in batch], dim=0)
+        sv = torch.stack([item['solvability'] for item in batch], dim=0)
         out['anchor_p'] = ap
         out['anchor_l'] = al
         out['anchor_v'] = av
+        out['solvability'] = sv
     return out
