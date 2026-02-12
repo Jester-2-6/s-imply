@@ -24,7 +24,8 @@ class ReconvPairPredictor(abc.ABC):
     def predict(
         self, 
         pair_info: Dict[str, Any], 
-        constraints: Dict[int, LogicValue]
+        constraints: Dict[int, LogicValue],
+        seed: Optional[int] = None
     ) -> List[Dict[int, LogicValue]]:
         """
         Predict a list of valid assignments for the given pair, respecting constraints.
@@ -46,17 +47,18 @@ class HierarchicalReconvSolver:
     ordered from shortest to longest.
     """
 
-    def __init__(self, circuit: List[Gate], predictor: ReconvPairPredictor, recorder = None):
+    def __init__(self, circuit: List[Gate], predictor: ReconvPairPredictor, recorder = None, verbose: bool = False):
         self.circuit = circuit
         self.predictor = predictor
         self.recorder = recorder
+        self.verbose = verbose
         # Helper for consistency checks, reused from existing codebase
         self.consistency_checker = PathConsistencySolver(circuit)
         
         # Populate fanout lists from fanin (if not already present)
         self._populate_fanouts()
 
-    def solve(self, target_node: int, target_val: LogicValue, constraints: Dict[int, LogicValue] = None) -> Optional[Dict[int, LogicValue]]:
+    def solve(self, target_node: int, target_val: LogicValue, constraints: Dict[int, LogicValue] = None, seed: Optional[int] = None) -> Optional[Dict[int, LogicValue]]:
         """
         Main entry point. Tries to justify target_node = target_val.
         
@@ -65,8 +67,14 @@ class HierarchicalReconvSolver:
         3. Recursively solve pairs (backtracking).
         4. Return final assignment or None.
         """
+        if self.verbose:
+            print(f"[Solver] Solving for Gate {target_node} = {target_val} with {len(constraints) if constraints else 0} constraints")
+            
         # 1. & 2. Find relevant pairs
         pairs = self._collect_and_sort_pairs(target_node)
+        
+        if self.verbose:
+            print(f"[Solver] Found {len(pairs)} reconvergent pairs")
         
         # Initial constraints: target + provided constraints
         initial_constraints = {}
@@ -77,32 +85,51 @@ class HierarchicalReconvSolver:
         initial_constraints[target_node] = target_val
         
         # 3. Recursive Solve
-        final_assignment = self._solve_recursive(0, pairs, initial_constraints)
+        final_assignment = self._solve_recursive(0, pairs, initial_constraints, seed)
         
         return final_assignment
 
     def _collect_and_sort_pairs(self, root_node: int) -> List[Dict[str, Any]]:
         """
         Identify reconvergent pairs in the transitive fanin of root_node,
-        sorted by their 'span' (shortest path length or loop size).
+        sorted by their proximity to the fault and path complexity.
+        
+        Priority: Pairs closer to the fault site (shorter distance from reconv to target)
+        and with shorter total path lengths should be solved first.
         """
         # A. Transitive Fanin Cone
         cone_nodes = self._get_transitive_fanin(root_node)
         
         # B. Find Pairs within this cone
-        # This is computationally expensive if we scan the whole circuit.
-        # We can try to use a localized search or assume we have a precomputed list.
-        # For this implementation, let's implement a cone-restricted search.
-        # We look for stems (nodes with >1 fanout in the cone) and see if they converge.
-        
         pairs = self._find_pairs_in_set(cone_nodes)
         
-        # C. Sort by "Shortest"
-        # Metric: Sum of lengths of the two branches (loop perimeter)
+        # C. Compute distance from reconvergence node to target for each pair
+        # BFS from root_node backwards to find distance
+        from collections import deque
+        distances = {root_node: 0}
+        queue = deque([root_node])
+        
+        while queue:
+            curr = queue.popleft()
+            curr_dist = distances[curr]
+            gate = self.circuit[curr]
+            fanins = getattr(gate, 'fin', []) or []
+            
+            for fin in fanins:
+                if fin in cone_nodes and fin not in distances:
+                    distances[fin] = curr_dist + 1
+                    queue.append(fin)
+        
+        # D. Sort by priority:
+        # Combined Score = Total Path Length + Distance to Target
+        # This prioritizes compact loops near the fault over distant small loops.
+        # Secondary sort by length ensures shortest paths are picked within similar distances.
         def pair_cost(p):
-            # paths[0] + paths[1] length
-            # Note: paths include intermediate nodes.
-            return len(p['paths'][0]) + len(p['paths'][1])
+            reconv_node = p['reconv']
+            dist_to_target = distances.get(reconv_node, 9999)
+            total_path_len = len(p['paths'][0]) + len(p['paths'][1])
+            # Return tuple: (Combined Score, Length)
+            return (total_path_len + dist_to_target, total_path_len)
             
         pairs.sort(key=pair_cost)
         
@@ -241,7 +268,8 @@ class HierarchicalReconvSolver:
         self, 
         pair_idx: int, 
         pairs: List[Dict[str, Any]], 
-        current_constraints: Dict[int, LogicValue]
+        current_constraints: Dict[int, LogicValue],
+        seed: Optional[int] = None
     ) -> Optional[Dict[int, LogicValue]]:
         """
         Backtracking solver.
@@ -256,15 +284,27 @@ class HierarchicalReconvSolver:
         """
         # Base Case: All pairs processed
         if pair_idx >= len(pairs):
+            if self.verbose:
+                print(f"[Solver] Base case reached. Returning partial solution.")
             return current_constraints
         
         pair = pairs[pair_idx]
+        if self.verbose:
+            indent = "  " * (pair_idx + 1)
+            stem = pair.get('start', pair.get('stem'))
+            print(f"[Solver]{indent} Processing Pair {pair_idx}: Stem {stem} -> Reconv {pair['reconv']}")
         
         # Get candidate solutions from Oracle
         # The predictor should return solutions that respect `current_constraints`.
         
         # UPDATE: Predictor now returns (candidates, inputs_snapshot)
-        prediction_result = self.predictor.predict(pair, current_constraints)
+        # Derive a unique seed for this step if a base seed is provided
+        step_seed = None
+        if seed is not None:
+             # simple mixing: seed + pair_idx (could be more complex if needed)
+             step_seed = (seed + pair_idx * 7919) % 2147483647
+             
+        prediction_result = self.predictor.predict(pair, current_constraints, seed=step_seed)
         
         # Handle backward compatibility if someone hasn't updated their predictor class
         inputs_snapshot = None
@@ -274,17 +314,22 @@ class HierarchicalReconvSolver:
              candidates = prediction_result
         
         if not candidates:
+            if self.verbose:
+                indent = "  " * (pair_idx + 1)
+                print(f"[Solver]{indent} No candidates from predictor. Backtracking.")
             # If the model cannot find any solution for this pair given constraints,
             # this path is dead. Backtrack.
             return None
             
-        for assignment_part in candidates:
+        for i, assignment_part in enumerate(candidates):
+            if self.verbose:
+                indent = "  " * (pair_idx + 1)
+                print(f"[Solver]{indent} Trying Candidate {i}: {assignment_part}")
+                
             # Log this decision attempt if recording
             step_record = None
             if self.recorder and inputs_snapshot:
                  # Log the attempt. 
-                 # We record the snapshot and the chosen assignment.
-                 # Note: "candidates" is a ranked list. We are trying "assignment_part" now.
                  step_record = self.recorder.log_step(
                      node_ids=inputs_snapshot['node_ids'],
                      mask_valid=inputs_snapshot['mask_valid'],
@@ -307,26 +352,33 @@ class HierarchicalReconvSolver:
                     new_constraints[k] = v
             
             if conflict:
+                if self.verbose:
+                    print(f"[Solver]{indent} Conflict detected. Skipping candidate.")
                 if step_record and self.recorder:
                      # Immediate conflict -> local failure
                      self.recorder.mark_backtrack(penalty=-0.5) 
                 continue
                 
             # 2. Recurse
-            result = self._solve_recursive(pair_idx + 1, pairs, new_constraints)
+            result = self._solve_recursive(pair_idx + 1, pairs, new_constraints, seed)
             
             if result is not None:
+                if self.verbose:
+                    print(f"[Solver]{indent} Candidate {i} successful.")
                 # Found a valid complete assignment!
-                # We do NOT mark success here per pair, 
-                # but implicit success is that we don't penalize.
-                # Global success will reward everyone later.
                 return result
             
             # If we returned None, it means a conflict happened deeper in the recursion.
             # This choice (assignment_part) led to a failure.
+            if self.verbose:
+                print(f"[Solver]{indent} Candidate {i} failed in recursion. Backtracking.")
+                
             if step_record and self.recorder:
                  self.recorder.mark_backtrack(penalty=-0.5)
                  
         # If no candidates lead to a solution, backtrack.
+        if self.verbose:
+            indent = "  " * (pair_idx + 1)
+            print(f"[Solver]{indent} All candidates failed. Backtracking pair {pair_idx}.")
         return None
 

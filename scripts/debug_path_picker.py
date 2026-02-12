@@ -47,7 +47,7 @@ def print_path(circuit, path, indent="  "):
         arrow = " -> " if i < len(path) - 1 else ""
         print(f"{indent}  [{i}] {print_gate_info(circuit, node_id)}{arrow}")
 
-def debug_path_picker(output_file=None):
+def debug_path_picker(args=None, output_file=None):
     """Debug the path picker for c432 circuit, fault sa0 on node 296"""
     
     # Redirect output to file if specified
@@ -60,7 +60,8 @@ def debug_path_picker(output_file=None):
     print("="*80)
     
     # Parse circuit
-    circuit_path = 'data/bench/ISCAS85/c432.bench'
+    default_circuit = 'data/bench/ISCAS85/c432.bench'
+    circuit_path = args.circuit if args and hasattr(args, 'circuit') else default_circuit
     circuit, total_gates = parse_bench_file(circuit_path)
     
     print(f"\nCircuit: c432")
@@ -78,24 +79,56 @@ def debug_path_picker(output_file=None):
             print(print_gate_info(circuit, i))
     
     # Create fault: sa0 on node 22
-    fault = Fault(gate_id=296, value=LogicValue.D)  # D means stuck-at-0
+    fault_str = args.fault if args and hasattr(args, 'fault') else "296-1" # Default: 296 s-a-0 (D=1/0)
+    try:
+        gate_id, val = map(int, fault_str.split('-'))
+        fault_val = LogicValue.D if val == 0 else LogicValue.D_BAR 
+        # Actually, for ATPG input, usually it's stuck-at value, so we justify the opposite
+        # But here let's assume gate-s_a_val format.
+        # If stuck-at-0, we need D (1/0). If stuck-at-1, we need D_BAR (0/1).
+        fault = Fault(gate_id=gate_id, value=fault_val)
+    except:
+        print(f"Invalid fault format: {fault_str}. Using default 296-0")
+        fault = Fault(gate_id=296, value=LogicValue.D)
+        val = 0
+        
     print(f"\n" + "="*80)
-    print(f"FAULT: Gate {fault.gate_id} stuck-at-0")
+    print(f"FAULT: Gate {fault.gate_id} s-a-{val} (Value: {fault.value})")
     print(print_gate_info(circuit, fault.gate_id))
     print("="*80)
     
     # Create predictor and solver
     print("\nInitializing predictor and solver...")
     try:
+        from src.atpg.ai_podem import AiPodemConfig
+        
+        # Determine device
+        import torch
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        print(f"Using device: {device}")
+        
+        # Use model path from args or default
+        default_model = 'checkpoints/reconv_rl_model.pt'
+        model_path = args.model if args and hasattr(args, 'model') else default_model
+        
+        config = AiPodemConfig(
+            model_path=model_path,
+            device=device,
+            enable_ai_activation=True,
+            enable_ai_propagation=True
+        )
+        
         predictor = ModelPairPredictor(
+            circuit, 
             circuit_path, 
-            'checkpoints/reconv_rl_model.pt', 
-            circuit
+            config
         )
         solver = HierarchicalReconvSolver(circuit, predictor)
         print("✓ Predictor and solver initialized")
     except Exception as e:
         print(f"✗ Failed to initialize: {e}")
+        import traceback
+        traceback.print_exc()
         return
     
     # Get transitive fanin
@@ -149,17 +182,50 @@ def debug_path_picker(output_file=None):
     sorted_pairs = solver._collect_and_sort_pairs(fault.gate_id)
     print(f"Total pairs after sorting: {len(sorted_pairs)}")
     
-    for idx, pair in enumerate(sorted_pairs[:5]):  # Show top 5
+    # Compute distances from fault node for display
+    from collections import deque
+    distances = {fault.gate_id: 0}
+    queue = deque([fault.gate_id])
+    fanin_set = solver._get_transitive_fanin(fault.gate_id)
+    
+    while queue:
+        curr = queue.popleft()
+        curr_dist = distances[curr]
+        gate = circuit[curr]
+        fanins = getattr(gate, 'fin', []) or []
+        
+        for fin in fanins:
+            if fin in fanin_set and fin not in distances:
+                distances[fin] = curr_dist + 1
+                queue.append(fin)
+    
+    for idx, pair in enumerate(sorted_pairs):
         stem_key = 'start' if 'start' in pair else 'stem'
-        print(f"\n{idx + 1}. Stem: {pair[stem_key]}, Reconv: {pair['reconv']}, "
-              f"Paths: {len(pair['paths'])}")
+        reconv_node = pair['reconv']
+        
+        # Calculate metrics
+        path1_len = len(pair['paths'][0])
+        path2_len = len(pair['paths'][1])
+        total_path_len = path1_len + path2_len
+        dist_to_fault = distances.get(reconv_node, 9999)
+        combined_score = total_path_len + dist_to_fault
+        
+        print(f"\n{idx + 1}. Stem: {pair[stem_key]}, Reconv: {reconv_node} | "
+              f"Paths: [{path1_len}, {path2_len}] (Total: {total_path_len}) | "
+              f"Dist: {dist_to_fault} | Score: {combined_score}")
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description='Debug path picker for ATPG')
-    parser.add_argument('--output', '-o', default='debug_path_picker_output.txt',
-                        help='Output file path (default: debug_path_picker_output.txt)')
+    parser.add_argument('--output', '-o', default='debug_path_picker_output.log',
+                        help='Output file path (default: debug_path_picker_output.log)')
+    parser.add_argument('--model', type=str, default='checkpoints/reconv_rl_model.pt',
+                        help='Path to model checkpoint')
+    parser.add_argument('--circuit', type=str, default='data/bench/ISCAS85/c432.bench',
+                        help='Path to circuit .bench file')
+    parser.add_argument('--fault', type=str, default='296-0',
+                        help='Fault string (gate-val)')
     args = parser.parse_args()
     
-    debug_path_picker(output_file=args.output)
+    debug_path_picker(args=args, output_file=args.output)
     print(f"\nOutput written to: {args.output}", file=sys.stderr)

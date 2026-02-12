@@ -122,7 +122,19 @@ Integration of DeepGate embeddings and AI-assisted justification/propagation eva
 
 *\*Note: Low FC on c432 is a known issue in the base PODEM implementation related to XOR logic handling and D-frontier sorting, currently under investigation.*
 
+### C. Post-Processing Logic Gate Fix
+**Timestamp: 2026-02-12**
+Diagnostic analysis of 185-epoch trained model revealed NOT gates as sole failure mode (40.9% error rate, 89% of all edge errors). Model outputs p≈0.50 at NOT gates due to non-autoregressive architecture unable to condition on previous predictions. Forward-propagation post-processing (`post_process_logic_gates()`) in `ai_podem.py` fixes NOT/BUFF deterministic gates:
+
+| Metric | Before | After | Δ |
+| :--- | :--- | :--- | :--- |
+| **Zero-error rate** | 75.5% | **96.8%** | **+21.3%** |
+| **Edge accuracy** | 98.1% | **99.8%** | +1.7% |
+| **Edge errors (1280 samples)** | 518 | **52** | **-90%** |
+| **Reconvergence failures** | 0 | 0 | ±0 |
+
 ## 7. Current Challenges & Roadmap
 -   **Handling "Don't Cares" (X)**: The current model predicts binary 0/1. Integrating explicit X prediction or X-tolerance in the loss function is an ongoing area of research.
 -   **Complex Reconvergence**: Scaling from pair-wise paths to N-ary reconvergent structures.
 -   **Integration with Commercial ATPG**: Using the model's predictions as high-quality initial heuristics for industry-standard ATPG tools.
+-   **Remaining Edge Errors (~3.2%)**: Post-processing fixes NOT/BUFF but AND/OR/NAND/NOR inequality violations remain. Consider iterative refinement or autoregressive decoding for further improvement.

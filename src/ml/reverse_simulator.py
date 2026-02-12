@@ -87,6 +87,8 @@ class ReverseCircuitTransformer(nn.Module):
             dropout=dropout,
             batch_first=False
         )
+        # Use new nested tensor API to avoid warnings
+        encoder_layer.enable_nested_tensor = True
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.cross_attention = nn.MultiheadAttention(
             embed_dim=d_model,

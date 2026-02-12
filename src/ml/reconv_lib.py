@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+from typing import Optional
 
 # --- Helper: Standard Positional Encoding ---
 # Injects position information into the input embeddings.
@@ -77,6 +78,8 @@ class MultiPathTransformer(nn.Module):
             dim_feedforward=dim_feedforward,
             batch_first=True
         )
+        # Use new nested tensor API to avoid warnings
+        encoder_layer.enable_nested_tensor = True
         self.shared_path_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_encoder_layers)
 
         # 2. Path Interaction Layer
@@ -88,6 +91,8 @@ class MultiPathTransformer(nn.Module):
             dim_feedforward=dim_feedforward,
             batch_first=True
         )
+        # Use new nested tensor API to avoid warnings
+        interaction_layer.enable_nested_tensor = True
         self.path_interaction_layer = nn.TransformerEncoder(interaction_layer, num_layers=num_interaction_layers)
         
         # 3. Prediction Heads
@@ -106,15 +111,14 @@ class MultiPathTransformer(nn.Module):
         
         self.pos_encoder = PositionalEncoding(self.model_dim)
 
-    def forward(self, path_list, attention_masks, gate_types=None):
+    def forward(self, path_list, attention_masks, gate_types=None, seed: Optional[int] = None, perturb_scale: float = 0.0):
         """
         Args:
-            path_list (Tensor): A padded tensor of path embeddings.
-                                Shape: (batch_size, num_paths, seq_len, embedding_dim)
-            attention_masks (Tensor): A boolean mask to ignore padded tokens.
-                                     Shape: (batch_size, num_paths, seq_len)
-            gate_types (Tensor, optional): Gate types for each node.
-                                           Shape: (batch_size, num_paths, seq_len)
+            path_list (Tensor): [batch_size, num_paths, seq_len, input_dim]
+            attention_masks (Tensor): [batch_size, num_paths, seq_len] (True for valid tokens)
+            gate_types (Tensor): [batch_size, num_paths, seq_len] (Optional gate types)
+            seed (int, optional): Random seed for noise injection.
+            perturb_scale (float): Scale of noise to inject (default 0.0).
         Returns:
             per_node_logits (Tensor): [B, P, L, 2]
             solvability_logits (Tensor): [B, 2]
@@ -123,17 +127,25 @@ class MultiPathTransformer(nn.Module):
 
         if gate_types is not None:
              # Embed gate types
-             # gate_types: [B, P, L] -> [B, P, L, 16]
+             # gate_types: [B, P, L] -> [B, P, L, 64]
              gt_emb = self.gate_type_emb(gate_types.clamp(0, 11))
              # Concatenate to path embeddings
              path_list = torch.cat([path_list, gt_emb], dim=-1) # [B, P, L, D+64]
 
+        # Apply input projection to model dimension if needed
+        path_list = self.input_proj(path_list)
+
+        # DEBUG: Noise Injection
+        if seed is not None and perturb_scale > 0.0:
+            gen = torch.Generator(device=path_list.device)
+            gen.manual_seed(seed)
+            noise = torch.randn(path_list.shape, generator=gen, device=path_list.device) * perturb_scale
+            path_list = path_list + noise
+            
         # --- Step 1: Encode Each Path Independently ---
         # Reshape the input to process all paths in the batch at once.
-        # (batch_size * num_paths, seq_len, input_aug_dim)
-        flat_paths = path_list.view(-1, seq_len, self.input_aug_dim)
-        # Project to model dimension if needed
-        flat_paths = self.input_proj(flat_paths)
+        # (batch_size * num_paths, seq_len, model_dim)
+        flat_paths = path_list.view(-1, seq_len, self.model_dim)
         
         # Apply Positional Encoding to learn sequential order (input -> output)
         flat_paths = self.pos_encoder(flat_paths)

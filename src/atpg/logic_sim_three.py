@@ -177,7 +177,10 @@ def fault_is_at_po(circuit: List[Gate], total_gates: int) -> bool:
 def print_pi(circuit: List[Gate], total_gates: int) -> str:
     """Returns string represention of PI values."""
     res = []
+    # Map logic values: 0->0, 1->1, 2->X, 3(D)->1, 4(DB)->0
+    val_map = {0: '0', 1: '1', 2: 'X', 3: '1', 4: '0'}
     for i in range(1, total_gates + 1):
         if circuit[i].type == GateType.INPT:
-            res.append(str(int(circuit[i].val)))
+            val = int(circuit[i].val)
+            res.append(val_map.get(val, str(val)))
     return "".join(res)

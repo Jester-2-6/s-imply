@@ -89,7 +89,12 @@ class TrainConfig:
     constrained_curriculum: bool = False
     max_constraint_prob: float = 0.5
     enforce_constraints: bool = True
+    enforce_constraints: bool = True
     processed_dir: Optional[str] = None
+    
+    # Phase 7: Logic Consistency
+    lambda_logic: float = 0.0  # Weight for reconvergence logic consistency loss
+    lambda_full_logic: float = 0.0  # Weight for full-path gate consistency loss
 
 
 def make_dataloaders(cfg: TrainConfig, device: torch.device) -> Tuple[DataLoader, DataLoader]:
@@ -523,10 +528,10 @@ def generate_constraints(
         constraint_vals: [B, P, L] Long tensor (0 or 1) - valid values
     """
     B, P, L = node_ids.shape
-    device = node_ids.device
-    
-    constraint_mask = torch.zeros((B, P, L), dtype=torch.bool, device=device)
-    constraint_vals = torch.zeros((B, P, L), dtype=torch.long, device=device)
+    # IMPORTANT: Use CPU for initial creation of these buffers to avoid generic CUDA kernel errors 
+    # during initialization which were observed on certain GPU architectures.
+    constraint_mask = torch.zeros((B, P, L), dtype=torch.bool, device='cpu')
+    constraint_vals = torch.zeros((B, P, L), dtype=torch.long, device='cpu')
     
     if prob <= 0.0:
         return constraint_mask, constraint_vals
@@ -585,13 +590,13 @@ def generate_constraints(
             else:
                 flat_vals.append(-1)
         
-        vals_t = torch.tensor(flat_vals, dtype=torch.long, device=device).view(P, L)
+        vals_t = torch.tensor(flat_vals, dtype=torch.long, device='cpu').view(P, L)
         
         # Mask generation: Only where we have a valid value (0 or 1)
         valid_val_mask = vals_t >= 0
         
         # Random mask based on prob
-        rand_probs = torch.rand((P, L), device=device)
+        rand_probs = torch.rand((P, L), device='cpu')
         mask_b = (rand_probs < prob) & valid_val_mask
         
         constraint_mask[b] = mask_b
@@ -625,6 +630,243 @@ def policy_loss_and_metrics(
     """
 
     B, P, L, C = logits.shape
+
+
+def calculate_logic_loss(
+    node_ids: torch.Tensor,     # [B, P, L]
+    gate_types: torch.Tensor,   # [B, P, L]
+    logits: torch.Tensor,       # [B, P, L, 2]
+    mask_valid: torch.Tensor,   # [B, P, L]
+    device: torch.device
+) -> torch.Tensor:
+    """
+    Computes a Logic Consistency Loss by checking local gate logic.
+    Vectorized implementation to avoid Python loops.
+    """
+    B, P, L_dim = node_ids.shape
+    
+    # 1. Identify Reconvergence Gate Indices per Batch Element
+    # The reconvergence gate is the last valid node in each path.
+    # Paths in a sample all reconverge to the same gate (by dataset construction).
+    # We can pick the first valid path to find the location.
+    
+    path_lens = mask_valid.long().sum(dim=2) # [B, P]
+    # We need at least one path with length >= 2 (input -> reconv)
+    valid_paths_mask = (path_lens >= 2) # [B, P]
+    
+    # Filter batches that have no valid paths
+    batch_has_valid = valid_paths_mask.any(dim=1) # [B]
+    if not batch_has_valid.any():
+        return torch.tensor(0.0, device=device)
+
+    # 2. Gather Inputs and Outputs
+    # Inputs are at index (len-2), Output (Reconv) is at index (len-1)
+    
+    # We create a gather index for the last node (reconv) and 2nd last (input)
+    # Indices: [B, P]
+    last_idx = (path_lens - 1).clamp(min=0)
+    second_last = (last_idx - 1).clamp(min=0)
+    
+    # Get Probabilities of logic-1
+    probs_1 = torch.softmax(logits, dim=-1)[..., 1] # [B, P, L]
+    
+    # Gather output probs: [B, P]
+    # We gather from [B, P, L] using indices [B, P]
+    idx_reconv = last_idx.unsqueeze(-1) # [B, P, 1]
+    p_out_per_path = probs_1.gather(2, idx_reconv).squeeze(-1) # [B, P]
+    
+    # Gather input probs: [B, P]
+    idx_input = second_last.unsqueeze(-1) # [B, P, 1]
+    p_in_per_path = probs_1.gather(2, idx_input).squeeze(-1) # [B, P]
+    
+    # Gate Types for Reconv Gate: [B, P]
+    # Should be identical across P for the same B (all paths reconverge to same gate)
+    # We'll just take the mean/mode or assume consistency.
+    gt_reconv = gate_types.gather(2, idx_reconv).squeeze(-1) # [B, P]
+    
+    # 3. Compute Implied Probabilities (Vectorized)
+    # We need to aggregate inputs for each batch sample.
+    # Inputs are p_in_per_path[b, :] where valid_paths_mask[b, :] is True.
+    
+    # Since P is small (fixed max paths), we can mask and compute.
+    # Mask invalid paths with identity values for the operation.
+    # AND/NAND: identity = 1.0
+    # OR/NOR: identity = 0.0
+    
+    # Prepare floating point mask
+    f_mask = valid_paths_mask.float()
+    
+    # AND Logic: Product of inputs
+    # Mask invalid entries with 1.0 (so they don't affect product)
+    in_and = p_in_per_path * f_mask + (1.0 - f_mask) 
+    # Product across P dim
+    implied_and = in_and.prod(dim=1) # [B]
+    
+    # OR Logic: 1 - Product(1-inputs)
+    # Mask invalid entries with 0.0 (so 1-0=1, product neutral)
+    # Wait, for OR: we want prod(1-x). If specific x is invalid, we want it to be 0? 
+    # No, we want 1-x to be 1. So x must be 0.
+    in_or = p_in_per_path * f_mask # invalid -> 0
+    implied_or = 1.0 - (1.0 - in_or).prod(dim=1) # [B]
+    
+    # Reconv Gate Type (per batch)
+    # We can take the max/first valid gate type per batch
+    # (Assuming all paths in sample agree)
+    # Gate types are integers. We need to index into operation results.
+    
+    # Let's get a representative gate type for each batch
+    # We can pick the type from the first valid path.
+    # Argmax of mask gives index of first True.
+    first_valid_idx = valid_paths_mask.long().argmax(dim=1) # [B]
+    # Gather gate type
+    batch_gt = gt_reconv.gather(1, first_valid_idx.unsqueeze(1)).squeeze(1) # [B]
+    
+    # Calculate implied p1 for all types
+    # Initialize with 0.5
+    target_p1 = torch.full((B,), 0.5, device=device)
+    
+    is_and = (batch_gt == GateType.AND)
+    is_nand = (batch_gt == GateType.NAND)
+    is_or = (batch_gt == GateType.OR)
+    is_nor = (batch_gt == GateType.NOR)
+    is_not = (batch_gt == GateType.NOT)
+    is_buff = (batch_gt == GateType.BUFF)
+    
+    # Assign Implied Targets
+    # AND
+    target_p1[is_and] = implied_and[is_and]
+    
+    # NAND (1 - AND)
+    target_p1[is_nand] = 1.0 - implied_and[is_nand]
+    
+    # OR
+    target_p1[is_or] = implied_or[is_or]
+    
+    # NOR (1 - OR)
+    target_p1[is_nor] = 1.0 - implied_or[is_nor]
+    
+    # BUFF/NOT
+    # For single input gates, we usually have 1 path, or duplicate paths.
+    # Mean of inputs is a safe bet for duplicate paths.
+    # But strictly, BUFF/NOT should have 1 input.
+    # Sum / Count is better if we only have valid paths.
+    sum_in = (p_in_per_path * f_mask).sum(dim=1)
+    count_in = f_mask.sum(dim=1).clamp(min=1.0)
+    mean_in = sum_in / count_in
+    
+    target_p1[is_buff] = mean_in[is_buff]
+    target_p1[is_not] = 1.0 - mean_in[is_not]
+    
+    # 4. Compute Loss
+    # Compare against Predicted Output
+    # We assume 'mean' prediction across duplicate paths for the output as well
+    sum_out = (p_out_per_path * f_mask).sum(dim=1)
+    mean_out = sum_out / count_in
+    
+    # Only compute loss for supported gate types and valid batches
+    supported = (is_and | is_nand | is_or | is_nor | is_not | is_buff)
+    mask_calc = (batch_has_valid & supported)
+    
+    if not mask_calc.any():
+        return torch.tensor(0.0, device=device)
+        
+    loss = F.mse_loss(mean_out[mask_calc], target_p1[mask_calc])
+    
+    return loss
+
+
+def calculate_full_logic_loss(
+    gate_types: torch.Tensor,   # [B, P, L]
+    logits: torch.Tensor,       # [B, P, L, 2]
+    mask_valid: torch.Tensor,   # [B, P, L]
+    device: torch.device
+) -> torch.Tensor:
+    """
+    Full-path gate consistency loss.
+    Penalizes ALL edge-level gate logic violations along paths as a direct
+    differentiable loss (not just reward shaping).
+    """
+    probs_1 = torch.softmax(logits, dim=-1)[..., 1]  # [B, P, L]
+    
+    valid_edges = mask_valid[:, :, 1:] & mask_valid[:, :, :-1]  # [B, P, L-1]
+    if not valid_edges.any():
+        return torch.tensor(0.0, device=device)
+    
+    prev_p = probs_1[:, :, :-1]
+    cur_p = probs_1[:, :, 1:]
+    gt_cur = gate_types[:, :, 1:]  # [B, P, L-1]
+    
+    viol = torch.zeros_like(prev_p)
+    
+    # NOT: |cur - (1-prev)|^2
+    m = gt_cur == GateType.NOT
+    if m.any():
+        viol[m] = (cur_p[m] - (1.0 - prev_p[m])) ** 2
+    
+    # BUFF: |cur - prev|^2
+    m = gt_cur == GateType.BUFF
+    if m.any():
+        viol[m] = (cur_p[m] - prev_p[m]) ** 2
+    
+    # AND: cur <= prev => ReLU(cur - prev)^2
+    m = gt_cur == GateType.AND
+    if m.any():
+        viol[m] = F.relu(cur_p[m] - prev_p[m]) ** 2
+    
+    # NAND: cur >= 1-prev => ReLU((1-prev) - cur)^2
+    m = gt_cur == GateType.NAND
+    if m.any():
+        viol[m] = F.relu((1.0 - prev_p[m]) - cur_p[m]) ** 2
+    
+    # OR: cur >= prev => ReLU(prev - cur)^2
+    m = gt_cur == GateType.OR
+    if m.any():
+        viol[m] = F.relu(prev_p[m] - cur_p[m]) ** 2
+    
+    # NOR: cur <= 1-prev => ReLU(cur - (1-prev))^2
+    m = gt_cur == GateType.NOR
+    if m.any():
+        viol[m] = F.relu(cur_p[m] - (1.0 - prev_p[m])) ** 2
+    
+    # Heavy weights for deterministic gates
+    edge_weights = torch.ones_like(gt_cur, dtype=torch.float32)
+    edge_weights[gt_cur == GateType.NOT] = 20.0
+    edge_weights[gt_cur == GateType.BUFF] = 20.0
+    
+    viol = viol * edge_weights * valid_edges.float()
+    
+    valid_edge_counts = valid_edges.sum(dim=(1,2)).float().clamp(min=1.0)
+    loss_per_sample = viol.sum(dim=(1,2)) / valid_edge_counts
+    
+    return loss_per_sample.mean()
+
+
+def reinforce_loss(
+    logits: torch.Tensor,
+    gate_types: torch.Tensor,
+    mask_valid: torch.Tensor,
+    solvability_logits: Optional[torch.Tensor] = None,
+    solvability_labels: Optional[torch.Tensor] = None,
+    anchor_p: Optional[torch.Tensor] = None,
+    anchor_l: Optional[torch.Tensor] = None,
+    anchor_v: Optional[torch.Tensor] = None,
+    entropy_beta: float = 0.01,
+    constraint_mask: Optional[torch.Tensor] = None,
+    constraint_vals: Optional[torch.Tensor] = None,
+    node_ids: Optional[torch.Tensor] = None,
+    lambda_logic: float = 0.0,
+    lambda_full_logic: float = 0.0,
+    soft_edge_lambda: float = 1.0,
+    normalize_reward: bool = True,
+    anchor_alpha: float = 0.1,
+) -> tuple[torch.Tensor, float, float, float, float]:
+    """Compute REINFORCE loss with LUT-inspired constraints and reconv consistency.
+
+    Returns: (loss, avg_reward, valid_rate, edge_acc, constraint_violation_rate)
+    """
+
+    B, P, L, C = logits.shape
+
     # Sample actions
     actions = torch.distributions.Categorical(logits=logits).sample().detach()  # [B, P, L]
     
@@ -813,7 +1055,7 @@ def policy_loss_and_metrics(
     
     # Weighting and masking
     edge_weights = torch.ones_like(gt_cur, dtype=torch.float32)
-    edge_weights[gt_cur == GateType.NOT] = 12.0
+    edge_weights[gt_cur == GateType.NOT] = 20.0
     viol = viol * edge_weights * valid_edges.float()
     
     # Loss per sample
@@ -838,7 +1080,7 @@ def policy_loss_and_metrics(
     
     # Reconvergence Logic for SAT cases (Agreement = Bonus, Disagreement = Penalty)
     reconv_bonus = 0.5
-    reconv_penalty = -1.0
+    reconv_penalty = -2.0
     
     # If agree (err=0): reward += bonus
     # If disagree (err=1): reward = min(reward, penalty)
@@ -879,7 +1121,7 @@ def policy_loss_and_metrics(
     # We override the function argument default or just multiply here.
     # The argument `anchor_alpha` defaults to 0.1 in signature, but we can multiply.
     # Actually, better to change the call site, but for now I will boost it here.
-    effective_anchor_alpha = 1.0 
+    effective_anchor_alpha = anchor_alpha 
     
     if anchor_p is not None and anchor_l is not None and anchor_v is not None:
         idx = torch.arange(logits.size(0), device=logits.device)
@@ -944,6 +1186,27 @@ def policy_loss_and_metrics(
     # Add constraint loss and solvability loss
     loss = loss + constraint_loss + solvability_loss
 
+    # Logic Consistency Loss
+    if lambda_logic > 0.0 and node_ids is not None:
+        logic_loss = calculate_logic_loss(
+            node_ids=node_ids,
+            gate_types=gate_types,
+            logits=logits,
+            mask_valid=mask_valid,
+            device=logits.device
+        )
+        loss = loss + (lambda_logic * logic_loss)
+
+    # Full-Path Gate Consistency Loss
+    if lambda_full_logic > 0.0:
+        full_logic_loss = calculate_full_logic_loss(
+            gate_types=gate_types,
+            logits=logits,
+            mask_valid=mask_valid,
+            device=logits.device
+        )
+        loss = loss + (lambda_full_logic * full_logic_loss)
+
     # Recompute metrics for logging
     with torch.no_grad():
         avg_reward = raw_avg_reward # Log the raw reward
@@ -1006,22 +1269,26 @@ def train_one_epoch(model: nn.Module, loader: DataLoader, optim: torch.optim.Opt
         node_ids = batch['node_ids']
         files = batch['files']
         
+        # Initialize Logic Value Vector to "Unknown" [0, 0, 1] if enabled
+        if cfg.add_logic_value:
+            B_cur, P_cur, L_cur, D_cur = paths.shape
+            if D_cur >= 3:
+                # IMPORTANT: Perform this on CPU to avoid "CUDA error: no kernel image is available"
+                # which seems to happen on some GPU architectures with specific indexing patterns in DataParallel.
+                paths[..., D_cur-3] = 0.0
+                paths[..., D_cur-2] = 0.0
+                paths[..., D_cur-1] = 1.0
+
         if device.type == 'cuda':
             paths = paths.to(device, non_blocking=True)
             masks = masks.to(device, non_blocking=True)
             node_ids = node_ids.to(device, non_blocking=True)
 
-        # Initialize Logic Value Vector to "Unknown" [0, 0, 1] if enabled
-        if cfg.add_logic_value:
-            B_cur, P_cur, L_cur, D_cur = paths.shape
-            if D_cur >= 3:
-                # Optimized: set X bit (index 2) to 1, others to 0
-                paths[..., D_cur-3:D_cur-1] = 0.0
-                paths[..., D_cur-1] = 1.0
-
         # Generate Constraints
         c_prob = constraint_prob
         c_mask, c_vals = generate_constraints(node_ids, files, prob=c_prob)
+        c_mask = c_mask.to(device)
+        c_vals = c_vals.to(device)
 
         # Inject constraints into embeddings
         if cfg.add_logic_value:
@@ -1067,15 +1334,24 @@ def train_one_epoch(model: nn.Module, loader: DataLoader, optim: torch.optim.Opt
         with torch.amp.autocast('cuda', enabled=cfg.amp):
             logits, solv_logits = model(paths, masks, gate_types=gtypes if cfg.use_gate_type_embedding else None)
 
-            loss, avg_reward, valid_rate, batch_edge_acc, batch_c_viol = policy_loss_and_metrics(
-                logits, node_ids, masks, files, gtypes,
-                constraint_mask=c_mask, constraint_vals=c_vals,
-                anchor_p=anchor_p, anchor_l=anchor_l, anchor_v=anchor_v,
-                solvability_logits=solv_logits, solvability_labels=solv_labels,
-                anchor_alpha=cfg.anchor_reward_alpha,
-                normalize_reward=cfg.normalize_reward,
+            loss, avg_reward, valid_rate, batch_edge_acc, batch_c_viol = reinforce_loss(
+                logits=logits, 
+                gate_types=gtypes,
+                mask_valid=masks,
+                solvability_logits=solv_logits, 
+                solvability_labels=solv_labels,
+                anchor_p=anchor_p, 
+                anchor_l=anchor_l, 
+                anchor_v=anchor_v,
                 entropy_beta=cfg.entropy_beta,
+                constraint_mask=c_mask, 
+                constraint_vals=c_vals,
+                node_ids=node_ids,
+                lambda_logic=cfg.lambda_logic,
+                lambda_full_logic=cfg.lambda_full_logic,
                 soft_edge_lambda=cfg.soft_edge_lambda,
+                normalize_reward=cfg.normalize_reward,
+                anchor_alpha=cfg.anchor_reward_alpha,
             )
         
         scaler.scale(loss).backward()
@@ -1141,6 +1417,8 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, cfg: Tr
 
         c_prob = cfg.max_constraint_prob if cfg.constrained_curriculum else 0.0
         c_mask, c_vals = generate_constraints(node_ids, files, c_prob)
+        c_mask = c_mask.to(device)
+        c_vals = c_vals.to(device)
         
         if cfg.add_logic_value and c_mask.any():
             D = paths.shape[-1]
@@ -1168,15 +1446,24 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, cfg: Tr
 
         with torch.amp.autocast('cuda', enabled=cfg.amp):
             logits, solv_logits = model(paths, masks, gate_types=gtypes if cfg.use_gate_type_embedding else None)
-            loss, avg_reward, valid_rate, batch_edge_acc, batch_c_viol = policy_loss_and_metrics(
-                logits, node_ids, masks, files, gtypes,
-                constraint_mask=c_mask, constraint_vals=c_vals,
-                anchor_p=anchor_p, anchor_l=anchor_l, anchor_v=anchor_v,
-                solvability_logits=solv_logits, solvability_labels=solv_labels,
-                anchor_alpha=cfg.anchor_reward_alpha,
-                normalize_reward=cfg.normalize_reward,
+            loss, avg_reward, valid_rate, batch_edge_acc, batch_c_viol = reinforce_loss(
+                logits=logits,
+                gate_types=gtypes,
+                mask_valid=masks,
+                solvability_logits=solv_logits,
+                solvability_labels=solv_labels,
+                anchor_p=anchor_p,
+                anchor_l=anchor_l,
+                anchor_v=anchor_v,
                 entropy_beta=cfg.entropy_beta,
+                constraint_mask=c_mask,
+                constraint_vals=c_vals,
+                node_ids=node_ids,
+                lambda_logic=cfg.lambda_logic,
+                lambda_full_logic=cfg.lambda_full_logic,
                 soft_edge_lambda=cfg.soft_edge_lambda,
+                normalize_reward=cfg.normalize_reward,
+                anchor_alpha=cfg.anchor_reward_alpha,
             )
             
         total_loss += float(loss.item())
@@ -1247,6 +1534,8 @@ def cmd_train(args: argparse.Namespace) -> None:
         constrained_curriculum=getattr(args, 'constrained_curriculum', False),
         max_constraint_prob=getattr(args, 'max_constraint_prob', 0.5),
         processed_dir=getattr(args, 'processed_dir', None),
+        lambda_logic=getattr(args, 'lambda_logic', 0.0),
+        lambda_full_logic=getattr(args, 'lambda_full_logic', 0.0),
     )
     
     # Handle checkpoint-dir alias
@@ -1369,6 +1658,8 @@ def build_argparser() -> argparse.ArgumentParser:
                    help='Weight for soft edge consistency loss')
     t.add_argument('--max-len', type=int, default=0, help='Filter dataset for max path length (Curriculum Learning)')
     t.add_argument('--entropy-beta', type=float, default=0.0, help='Entropy regularization weight (negative to minimize)')
+    t.add_argument('--lambda-logic', type=float, default=0.0, help='Weight for reconvergence logic consistency loss (Phase 7)')
+    t.add_argument('--lambda-full-logic', type=float, default=0.0, help='Weight for full-path gate consistency loss')
 
     return p
 

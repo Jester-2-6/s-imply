@@ -171,6 +171,18 @@ class ReconvergentPathsDataset(Dataset):
         else:
             self.mem_has_anchors = False
 
+    @staticmethod
+    def _compatible_anchor_value(gate_type: int, prefer_value: int) -> int:
+        """Pick a compatible output value for the gate near the circuit output.
+        Heuristic mapping (non-controlling bias).
+        """
+        if gate_type == GateType.AND or gate_type == GateType.NAND:
+            return 1
+        if gate_type == GateType.OR or gate_type == GateType.NOR:
+            return 0
+        return int(prefer_value)
+
+
     def _gen_anchor_for_sample(self, node_ids: torch.Tensor, attn_mask: torch.Tensor, file_path: str, pair_info: Dict[str, Any]) -> Tuple[int, int, int, int]:
         """Pick a random path/gate, pick value, and check solvability.
         Returns (p, l, v, solvability). solvability=1 means UNSAT."""

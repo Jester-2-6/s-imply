@@ -33,9 +33,11 @@ from src.atpg.util import (
 sys.setrecursionlimit(500000)
 
 # PODEM constants
-FAILURE = 0
+# PODEM constants
+UNTESTABLE = 0
 SUCCESS = 1
 TIMEOUT = 2
+BACKTRACK_LIMIT = 3
 
 # Global variables
 depth = 0
@@ -114,6 +116,10 @@ def initialize(circuit: List[Gate], total_gates: int):
 
     gate_distances_back = calculate_distance_to_primary_inputs(circuit, total_gates)
     gate_distances_fwd = calculate_distance_to_primary_outputs(circuit, total_gates)
+    
+    # Reset all gate values to X to prevent state pollution from previous runs
+    for i in range(1, total_gates + 1):
+        circuit[i].val = LogicValue.XD
 
 def podem(
     circuit: List[Gate],
@@ -139,6 +145,9 @@ def podem(
         
     podem_start_time = time.time()
     podem_timeout = timeout
+    
+    # Reset per-run statistics (backtrack counts, etc.)
+    reset_statistics()
 
     from src.atpg.util import get_topological_order
 
@@ -177,7 +186,7 @@ def podem(
         if VERBOSE:
             print(f"Fault {fault.gate_id} ({fault.value}) detected")
             print("Pattern:", print_pi(circuit, total_gates))
-        return True
+        return SUCCESS
     else:
         # Provide detailed failure information for debugging
         try:
@@ -187,9 +196,9 @@ def podem(
         fault_label = "D" if fault.value == LogicValue.D else "DB"
         if VERBOSE:
             print(
-                f"Fault untestable: gate_id={fault.gate_id} gate_type={gate_type_name} fault={fault_label}"
+                f"Fault failed (code={result}): gate_id={fault.gate_id} gate_type={gate_type_name} fault={fault_label}"
             )
-        return False
+        return result
 
 
 # ---------- Recursion & RL backtrace ----------
@@ -202,12 +211,12 @@ def podem_recursion(circuit: List[Gate], total_gates: int, fault: Fault) -> int:
     total_recursive_calls += 1
     
     # Backtrack limit to prevent hanging
-    if backtrack_count > 1000:
-        return FAILURE
+    if backtrack_count > 100000:
+        return BACKTRACK_LIMIT
         
     # Wall-clock timeout
     if (time.time() - podem_start_time) > podem_timeout:
-        return FAILURE
+        return TIMEOUT
 
     try:
         if fault_is_at_po(circuit, total_gates):
@@ -215,12 +224,12 @@ def podem_recursion(circuit: List[Gate], total_gates: int, fault: Fault) -> int:
 
         objective = get_objective(circuit, fault)
         if objective.gate_id == -1:
-            return FAILURE
+            return UNTESTABLE
 
         # Backtrace to get PI assignment
         pi_assignment = backtrace_function(objective, circuit)
         if pi_assignment.gate_id == -1:
-            return FAILURE
+            return UNTESTABLE
 
         pi_id = pi_assignment.gate_id
         desired_val = pi_assignment.value
@@ -228,20 +237,26 @@ def podem_recursion(circuit: List[Gate], total_gates: int, fault: Fault) -> int:
         # Try desired value
         circuit[pi_id].val = desired_val
         logic_sim.logic_sim(circuit, total_gates, fault, topo_order=topological_order)
-        if podem_recursion(circuit, total_gates, fault) == SUCCESS:
+        res = podem_recursion(circuit, total_gates, fault)
+        if res == SUCCESS:
             return SUCCESS
+        if res != UNTESTABLE:
+            return res
             
         # Backtrack: try flipped value
         circuit[pi_id].val = 1 - desired_val
         logic_sim.logic_sim(circuit, total_gates, fault, topo_order=topological_order)
-        if podem_recursion(circuit, total_gates, fault) == SUCCESS:
+        res = podem_recursion(circuit, total_gates, fault)
+        if res == SUCCESS:
             return SUCCESS
+        if res != UNTESTABLE:
+             return res
             
         # Reset PI and return failure
         circuit[pi_id].val = LogicValue.XD
         logic_sim.logic_sim(circuit, total_gates, fault, topo_order=topological_order)
         backtrack_count += 1
-        return FAILURE
+        return UNTESTABLE
 
     finally:
         depth = max(0, depth - 1)

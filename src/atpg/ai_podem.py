@@ -7,7 +7,15 @@ from typing import List, Dict, Any, Optional, Tuple
 from src.util.struct import LogicValue, Gate, GateType, Fault
 from src.atpg.podem import podem, backtrace_wrapper, initialize, get_all_faults, simple_backtrace
 from src.atpg.recursive_reconv_solver import HierarchicalReconvSolver
+from src.atpg.recursive_reconv_solver import HierarchicalReconvSolver, ReconvPairPredictor
+from dataclasses import dataclass
 
+@dataclass
+class AiPodemConfig:
+    model_path: str
+    device: str = 'cpu'
+    enable_ai_activation: bool = True
+    enable_ai_propagation: bool = True
 class AIBacktracer:
     """
     Backtrace function that uses HierarchicalReconvSolver to satisfy objectives.
@@ -28,8 +36,12 @@ class AIBacktracer:
                if g.type == GateType.INPT and g.val in (LogicValue.ZERO, LogicValue.ONE):
                    current_constraints[i] = g.val
 
-            if self.verbose: print(f"  [AI-BT] Constraints: {current_constraints}")
-            solution = self.solver.solve(objective.gate_id, objective.value, current_constraints)
+            # Generate random seed based on timestamp
+            import time
+            current_seed = int(time.time() * 1000) % 10000000
+            if self.verbose: print(f"  [AI-BT] Constraints: {current_constraints}, Seed: {current_seed}")
+            
+            solution = self.solver.solve(objective.gate_id, objective.value, current_constraints, seed=current_seed)
             
             if solution:
                 if self.verbose: print(f"  [AI-BT] Solution: {solution}")
@@ -67,12 +79,67 @@ from src.ml.reconv_lib import MultiPathTransformer
 from src.ml.embedding_extractor import EmbeddingExtractor
 from src.atpg.logic_sim_three import logic_sim, reset_gates, print_pi
 
+
+def post_process_logic_gates(
+    vals: torch.Tensor,          # [P, L] predicted values (0 or 1)
+    gate_types: torch.Tensor,    # [P, L] gate type for each position
+    mask: torch.Tensor,          # [P, L] valid mask (True for real nodes)
+    constraints: Optional[Dict[int, 'LogicValue']] = None,
+    node_ids: Optional[torch.Tensor] = None,  # [P, L] for constraint lookup
+) -> torch.Tensor:
+    """Forward-propagate deterministic gate rules (NOT/BUFF) through paths.
+    
+    For each path, iterates from position 0 forward. At each position:
+    - NOT gate: force cur = 1 - prev
+    - BUFF gate: force cur = prev
+    - Others: keep model prediction (AND/OR/NAND/NOR satisfy inequality constraints)
+    
+    Also respects any externally provided constraints.
+    
+    Returns: corrected vals tensor [P, L]
+    """
+    corrected = vals.clone()
+    P, L = vals.shape
+    
+    for p in range(P):
+        path_len = mask[p].sum().item()
+        if path_len <= 1:
+            continue
+        
+        # If constraints exist, apply them to the first position
+        if constraints is not None and node_ids is not None:
+            nid = int(node_ids[p, 0].item())
+            if nid in constraints:
+                corrected[p, 0] = 0 if constraints[nid] == LogicValue.ZERO else 1
+        
+        # Forward propagate
+        for pos in range(1, int(path_len)):
+            gt = int(gate_types[p, pos].item())
+            prev_val = int(corrected[p, pos - 1].item())
+            
+            # Apply constraints first if available
+            if constraints is not None and node_ids is not None:
+                nid = int(node_ids[p, pos].item())
+                if nid in constraints:
+                    corrected[p, pos] = 0 if constraints[nid] == LogicValue.ZERO else 1
+                    continue
+            
+            # Deterministic gate rules
+            if gt == GateType.NOT:
+                corrected[p, pos] = 1 - prev_val
+            elif gt == GateType.BUFF:
+                corrected[p, pos] = prev_val
+            # AND/NAND/OR/NOR: keep model prediction (inequality-based)
+    
+    return corrected
+
+
 class ModelPairPredictor(ReconvPairPredictor):
-    def __init__(self, circuit_path: str, model_path: str, circuit: List[Gate]):
+    def __init__(self, circuit: List[Gate], circuit_path: str, config: AiPodemConfig):
         self.circuit_path = circuit_path
         self.circuit = circuit
-        # Force CPU for stability if CUDA is problematic, but try to honor availability
-        self.device = torch.device('cuda') 
+        self.config = config
+        self.device = torch.device(config.device) 
         # (Overriding to CPU because of the 'no kernel image' error in the environment)
         
         # Load embeddings (SLOW step: ideally cached)
@@ -90,7 +157,7 @@ class ModelPairPredictor(ReconvPairPredictor):
             self.struct_emb = None
             
         # Load Model
-        self.model = self._load_model(model_path)
+        self.model = self._load_model(config.model_path)
         self.solver = PathConsistencySolver(circuit)
 
     def _load_model(self, model_path: str):
@@ -125,11 +192,12 @@ class ModelPairPredictor(ReconvPairPredictor):
     def predict(
         self, 
         pair_info: Dict[str, Any], 
-        constraints: Dict[int, LogicValue]
+        constraints: Dict[int, LogicValue],
+        seed: Optional[int] = None
     ) -> Tuple[List[Dict[int, LogicValue]], Optional[Dict[str, Any]]]:
         if self.struct_emb is None or self.model is None:
             # Fallback to pure solver if model failed
-            return self._fallback_solve(pair_info, constraints)
+            return self._fallback_solve(pair_info, constraints)[0], None
 
         # 1. Prepare Batch for Model
         
@@ -150,6 +218,7 @@ class ModelPairPredictor(ReconvPairPredictor):
         
         if all_constrained and precomputed_assignment:
             # All gates already have values - skip model, return existing values
+            # Need strict type match for return tuple
             return [precomputed_assignment], None
         
         # Convert path node IDs to AIG IDs to get embeddings
@@ -213,11 +282,28 @@ class ModelPairPredictor(ReconvPairPredictor):
         
         # 2. Run Inference
         with torch.no_grad():
-            logits, solv_logits = self.model(batch_embs, batch_mask, batch_types)
+            # Inject noise if seed is provided. Scale could be configurable.
+            perturb_scale = 0.5 if seed is not None else 0.0
+            logits, solv_logits = self.model(
+                batch_embs, 
+                batch_mask, 
+                batch_types, 
+                seed=seed, 
+                perturb_scale=perturb_scale
+            )
         
         # 3. Decode Logits
         probs = torch.softmax(logits, dim=-1) # [1, P, L, 2]
         vals = torch.argmax(probs, dim=-1).squeeze(0) # [P, L]
+        
+        # 4. Post-process: enforce NOT/BUFF deterministic gate rules
+        vals = post_process_logic_gates(
+            vals,
+            batch_types.squeeze(0),  # [P, L]
+            batch_mask.squeeze(0),   # [P, L]
+            constraints=constraints,
+            node_ids=batch_ids.squeeze(0),  # [P, L]
+        )
         
         predicted_assignment = {}
         conflict = False
@@ -339,7 +425,14 @@ def ai_podem(
             if not circuit_path:
                  print("[AI-PODEM] Warning: circuit_path missing, AI might fail.")
             if predictor is None:
-                predictor = ModelPairPredictor(circuit_path, model_path, circuit)
+                # Create config from args
+                config = AiPodemConfig(
+                    model_path=model_path,
+                    device='cuda' if torch.cuda.is_available() else 'cpu',
+                    enable_ai_activation=enable_ai_activation,
+                    enable_ai_propagation=enable_ai_propagation
+                )
+                predictor = ModelPairPredictor(circuit, circuit_path, config)
             solver = HierarchicalReconvSolver(circuit, predictor)
     
     ai_assignment = None
