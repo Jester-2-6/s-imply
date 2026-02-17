@@ -54,6 +54,7 @@ class ReconvergentPathsDataset(Dataset):
         add_logic_value: bool = True,
         anchor_in_dataset: bool = False,
         max_len_filter: int = 0,
+        cache_size: int = 10,
     ):
         self.dataset_path = dataset_path
         self.device = device
@@ -64,6 +65,7 @@ class ReconvergentPathsDataset(Dataset):
         self.add_logic_value = add_logic_value
         self.anchor_in_dataset = anchor_in_dataset
         self.max_len_filter = max_len_filter
+        self.cache_size = cache_size
         self._prefer_value = int(prefer_value)
 
         # Disable processed mode if filtering is active (for simplicity)
@@ -181,8 +183,10 @@ class ReconvergentPathsDataset(Dataset):
                     meta = json.load(f)
                     self._shard_lens = meta["lens"]
                     self._total_len = sum(self._shard_lens)
-                    self._loaded_shard_idx = -1
-                    self._loaded_shard_data = None
+                    # Initialize LRU Cache
+                    from collections import OrderedDict
+
+                    self._shard_cache = OrderedDict()
                     return
             except Exception:
                 print("[WARNING] Failed to load shard_info.json, rescanning...")
@@ -206,8 +210,10 @@ class ReconvergentPathsDataset(Dataset):
                 raise
 
         self._total_len = total
-        self._loaded_shard_idx = -1
-        self._loaded_shard_data = None
+        # Initialize LRU Cache
+        from collections import OrderedDict
+
+        self._shard_cache = OrderedDict()
 
         # Save metadata for next time
         try:
@@ -226,16 +232,23 @@ class ReconvergentPathsDataset(Dataset):
         raise IndexError(f"Index {idx} out of range for dataset of size {self._total_len}")
 
     def _ensure_shard_loaded(self, shard_idx: int):
-        """Lazy load shard if not present."""
-        if self._loaded_shard_idx == shard_idx and self._loaded_shard_data is not None:
+        """Lazy load shard with LRU caching."""
+        if shard_idx in self._shard_cache:
+            # Move to end (most recently used)
+            self._shard_cache.move_to_end(shard_idx)
             return
 
         # Load new shard
-        print(f"\r[Dataset] Loading shard {shard_idx} from disk...", flush=True, end="")
+        # print(f"\r[Dataset] Loading shard {shard_idx} from disk...", flush=True, end="")
         path = self._shard_files[shard_idx]
         try:
-            self._loaded_shard_data = torch.load(path, map_location="cpu")
-            self._loaded_shard_idx = shard_idx
+            data = torch.load(path, map_location="cpu")
+            self._shard_cache[shard_idx] = data
+
+            # Enforce cache size
+            if len(self._shard_cache) > self.cache_size:
+                self._shard_cache.popitem(last=False)  # Remove FIFO (Least Recently Used)
+
         except Exception as e:
             print(f"[Dataset ERROR] Failed to load shard {path}: {e}")
             raise
@@ -251,12 +264,12 @@ class ReconvergentPathsDataset(Dataset):
         if getattr(self, "_use_processed", False):
             shard_idx, local_idx = self._get_shard_for_idx(idx)
             self._ensure_shard_loaded(shard_idx)
-            data = self._loaded_shard_data
+            data = self._shard_cache.get(shard_idx)
 
             if data is None:
                 raise RuntimeError(
                     f"Shard data is None! idx={idx} shard={shard_idx} "
-                    f"loaded_idx={self._loaded_shard_idx} pid={os.getpid()}"
+                    f"in_cache={shard_idx in self._shard_cache} pid={os.getpid()}"
                 )
 
             # Access data from the loaded shard dictionary
@@ -742,7 +755,7 @@ class ReconvergentPathsDataset(Dataset):
         )
 
 
-def reconv_collate(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+def reconv_collate(batch: List[Dict[str, Any]], max_paths: int = 0) -> Dict[str, Any]:
     """Collate variable-length samples into a batch.
 
     Parameters
@@ -778,7 +791,16 @@ def reconv_collate(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     else:
         D = ((D_raw // nhead) + 1) * nhead
 
+    # Truncate to max_paths (prevent OOM)
+    # Default 0 means no truncation (or use MAX_PATHS if passed)
+    if max_paths > 0:
+        MAX_PATHS = max_paths
+        if P > MAX_PATHS:
+            P = MAX_PATHS
+
     # Initialize batch tensors with zeros/False
+    # Use pinned memory if device is CPU (which it usually is in simple collation)
+    # But here device comes from batch items, usually CPU until DataLoader moves it
     paths = torch.zeros(B, P, L, D, device=device, dtype=torch.float32)
     masks = torch.zeros(B, P, L, dtype=torch.bool, device=device)
     node_ids = torch.zeros(B, P, L, dtype=torch.long, device=device)
@@ -788,12 +810,22 @@ def reconv_collate(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     # Fill in data from each sample
     for b, item in enumerate(batch):
         p_i, l_i, d = item["paths_emb"].shape
+
+        # If sample has more paths than limit, we must truncate or sample
+        # Simple truncation: take first MAX_PATHS
+        # Better: take random or sort? Top-k longest paths might be best?
+        # For now, simple truncation for speed.
+        if p_i > P:
+            p_curr = P
+        else:
+            p_curr = p_i
+
         # Copy embeddings (padding happens automatically via zeros initialization)
-        paths[b, :p_i, :l_i, :d] = item["paths_emb"]
-        masks[b, :p_i, :l_i] = item["attn_mask"]
-        node_ids[b, :p_i, :l_i] = item["node_ids"]
+        paths[b, :p_curr, :l_i, :d] = item["paths_emb"][:p_curr]
+        masks[b, :p_curr, :l_i] = item["attn_mask"][:p_curr]
+        node_ids[b, :p_curr, :l_i] = item["node_ids"][:p_curr]
         if "gate_types" in item:
-            gate_types[b, :p_i, :l_i] = item["gate_types"]
+            gate_types[b, :p_curr, :l_i] = item["gate_types"][:p_curr]
         files.append(item["file"])
 
     out: Dict[str, Any] = {

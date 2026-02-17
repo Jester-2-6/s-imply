@@ -36,7 +36,6 @@ from src.ml.core.dataset import (
     _generate_anchor,
     _inject_anchor_into_embeddings,
     generate_constraints,
-    reconv_collate,
     resolve_gate_types,
 )
 from src.ml.core.loss import (
@@ -108,7 +107,10 @@ class TrainConfig:
     # Memory optimization
     grad_accum: int = 1
     checkpointing: bool = False
-    micro_batch_size: int = 256  # Safe default to avoid prefetch memory blowup
+    grad_accum: int = 1
+    checkpointing: bool = False
+    shard_cache_size: int = 10
+    max_paths: int = 200
 
 
 def make_dataloaders(cfg: TrainConfig, device: torch.device) -> Tuple[DataLoader, DataLoader]:
@@ -126,6 +128,16 @@ def make_dataloaders(cfg: TrainConfig, device: torch.device) -> Tuple[DataLoader
 
     # For best throughput, keep dataset tensors on CPU and move whole batches to GPU
     dataset_device = torch.device("cpu") if device.type == "cuda" else device
+
+    # Import collate function and partial it if needed
+    import functools
+
+    from src.ml.core.dataset import reconv_collate
+
+    final_collate_fn = reconv_collate
+    if cfg.max_paths > 0:
+        final_collate_fn = functools.partial(reconv_collate, max_paths=cfg.max_paths)
+
     print(f"Creating dataset (device={dataset_device})...", flush=True)
     dataset = ReconvergentPathsDataset(
         cfg.dataset,
@@ -136,6 +148,7 @@ def make_dataloaders(cfg: TrainConfig, device: torch.device) -> Tuple[DataLoader
         add_logic_value=cfg.add_logic_value,
         anchor_in_dataset=cfg.dataset_anchor_hint,
         max_len_filter=cfg.max_len,
+        cache_size=cfg.shard_cache_size,
     )
     print(f"Dataset ready. Splitting {len(dataset)} samples...", flush=True)
     # Minimal split: 90/10 train/val
@@ -153,9 +166,9 @@ def make_dataloaders(cfg: TrainConfig, device: torch.device) -> Tuple[DataLoader
         )
         train_loader = DataLoader(
             train_set,
-            batch_size=cfg.micro_batch_size,
+            batch_size=cfg.batch_size,
             shuffle=True,
-            collate_fn=reconv_collate,
+            collate_fn=final_collate_fn,
             num_workers=cfg.num_workers,
             pin_memory=cfg.pin_memory,
             prefetch_factor=2 if cfg.num_workers > 0 else None,
@@ -163,9 +176,9 @@ def make_dataloaders(cfg: TrainConfig, device: torch.device) -> Tuple[DataLoader
         )
         val_loader = DataLoader(
             val_set,
-            batch_size=cfg.micro_batch_size,
+            batch_size=cfg.batch_size,
             shuffle=False,
-            collate_fn=reconv_collate,
+            collate_fn=final_collate_fn,
             num_workers=cfg.num_workers,
             pin_memory=cfg.pin_memory,
             prefetch_factor=2 if cfg.num_workers > 0 else None,
@@ -173,14 +186,24 @@ def make_dataloaders(cfg: TrainConfig, device: torch.device) -> Tuple[DataLoader
         )
         print("DataLoaders initialized.", flush=True)
     else:
+        # For CPU
         train_loader = DataLoader(
             train_set,
             batch_size=cfg.batch_size,
             shuffle=True,
-            collate_fn=reconv_collate,
+            collate_fn=final_collate_fn,
+            num_workers=cfg.num_workers,
+            pin_memory=cfg.pin_memory,
+            persistent_workers=cfg.num_workers > 0,
         )
         val_loader = DataLoader(
-            val_set, batch_size=cfg.batch_size, shuffle=False, collate_fn=reconv_collate
+            val_set,
+            batch_size=cfg.batch_size,
+            shuffle=False,
+            collate_fn=final_collate_fn,
+            num_workers=cfg.num_workers,
+            pin_memory=cfg.pin_memory,
+            persistent_workers=cfg.num_workers > 0,
         )
     return train_loader, val_loader
 
@@ -244,20 +267,10 @@ def train_one_epoch(
         print(f"Starting epoch {epoch} loop (waiting for DataLoader)...", flush=True)
     pbar = tqdm(loader, desc=f"Epoch {epoch}", total=target_batches, disable=not cfg.verbose)
 
-    # Calculate actual grad accumulation needed to hit target batch size
-    # logical_batch_size = cfg.batch_size (user's intended total batch)
-    accum_steps = max(1, cfg.batch_size // cfg.micro_batch_size)
-    if cfg.grad_accum > 1:
-        # If user explicitly set grad_accum, honor it as well (multiplier)
-        accum_steps *= cfg.grad_accum
+    # Calculate actual grad accumulation
+    accum_steps = cfg.grad_accum
 
-    print(
-        f"[Memory] Total Batch={cfg.batch_size}, \
-            Micro-Batch={cfg.micro_batch_size}, \
-            Accumulation Steps={accum_steps}"
-    )
-    if cfg.micro_batch_size > 1024:
-        print("[WARNING] micro-batch-size > 1024 may crash host RAM due to DataLoader prefetching.")
+    print(f"[Memory] Batch={cfg.batch_size}, Accumulation Steps={accum_steps}")
 
     for batch_idx, batch in enumerate(pbar):
         paths = batch["paths_emb"].to(device)
@@ -600,7 +613,8 @@ def cmd_train(args: argparse.Namespace) -> None:
         gumbel_anneal_rate=getattr(args, "gumbel_anneal_rate", 0.99),
         grad_accum=getattr(args, "grad_accum", 1),
         checkpointing=getattr(args, "checkpointing", False),
-        micro_batch_size=getattr(args, "micro_batch_size", 256),
+        shard_cache_size=getattr(args, "shard_cache_size", 10),
+        max_paths=getattr(args, "max_paths", 200),
     )
 
     # Handle checkpoint-dir alias
@@ -878,14 +892,20 @@ def build_argparser() -> argparse.ArgumentParser:
     t.add_argument(
         "--checkpointing",
         action="store_true",
-        default=False,
-        help="Use gradient checkpointing to save memory",
+        help="Enable gradient checkpointing to save VRAM.",
+    )
+
+    t.add_argument(
+        "--shard-cache-size",
+        type=int,
+        default=25,
+        help="Number of shards to cache in memory per worker. Maximize this to fill RAM.",
     )
     t.add_argument(
-        "--micro-batch-size",
+        "--max-paths",
         type=int,
-        default=256,
-        help="Amount of data processed at once. Keep small for memory safety.",
+        default=200,
+        help="Maximum number of paths per sample (truncation) to prevent OOM.",
     )
 
     return p

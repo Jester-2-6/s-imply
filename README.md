@@ -40,16 +40,18 @@ python -m src.ml.train train \
     --processed-dir /home/local1/cache-cw/processed_reconv/ \
     --output checkpoints/reconv_topology_3val_v1_ssd \
     --epochs 50 \
-    --batch-size 8192 \
+    --batch-size 3000 \
+    --grad-accum 1 \
+    --max-paths 256 \
+    --shard-cache-size 25 \
+    --checkpointing \
+    --num-workers 4 \
+    --amp --verbose \
     --lambda-logic 1.0 \
-    --num-workers 8 \
-    --pin-memory \
-    --amp \
     --ffn-dim 2048 \
     --model-dim 512 \
     --enc-layers 3 \
-    --int-layers 3 \
-    --verbose
+    --int-layers 3
 ```
 
 ### 4. AI-PODEM Inference & Benchmarking
