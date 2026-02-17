@@ -3,11 +3,12 @@ import shutil
 
 import gymnasium as gym
 
+from src.ml.data.embedding import bench_to_embed
 from src.util.aig import bench_to_aig_file
-from src.ml.gcn import bench_to_embed
 
 STAGING_DIR = "data/staging"
 AIG_PATH = os.path.join(STAGING_DIR, "circuit.bench")
+
 
 class SimplyEnv(gym.Env):
     def __init__(self):
@@ -17,9 +18,8 @@ class SimplyEnv(gym.Env):
 
     def reset(self):
         return self.observation_space.sample(), {}
-    
-    def load_circuit(self, circuit_path: str):
 
+    def load_circuit(self, circuit_path: str):
         if os.path.exists(STAGING_DIR):
             for filename in os.listdir(STAGING_DIR):
                 file_path = os.path.join(STAGING_DIR, filename)
@@ -29,7 +29,7 @@ class SimplyEnv(gym.Env):
                     elif os.path.isdir(file_path):
                         shutil.rmtree(file_path)
                 except Exception as e:
-                    print(f'Failed to delete {file_path}. Reason: {e}')
+                    print(f"Failed to delete {file_path}. Reason: {e}")
 
         shutil.copy(circuit_path, STAGING_DIR)
         self.mapping = bench_to_aig_file(circuit_path, AIG_PATH)

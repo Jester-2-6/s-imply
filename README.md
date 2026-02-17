@@ -1,76 +1,96 @@
 # s-imply
 
-Back implication prediction using attention for netlists.
+A Topology-Aware Justification Oracle for digital circuits using Multi-Path Transformers and 3-Valued Logic reasoning.
 
-## Reconvergent Path Justification System
+## 🚀 Key Features
+- **3-Valued Logic Reasoning**: Explicitly handles `0`, `1`, and `X` (Don't Care) logic states.
+- **Topology-Aware Embeddings**: Maps physical gate identities across reconvergent paths for global consistency.
+- **Physics-Informed Training**: Incorporates differentiable logic consistency loss to enforce Boolean truth tables.
+- **Hybrid AI-PODEM**: Integrates AI-based justification directly into the PODEM backtrace loop.
 
-A hybrid RL + supervised learning system for learning to justify reconvergent path structures in digital circuits.
+---
 
-### Quick Start
+## 🛠️ Usage Guide
+
+### 1. Data Preparation (Building Shards)
+Before training, convert large pickle datasets into optimized tensor shards for fast I/O.
 
 ```bash
-# Activate environment
-conda activate torch
-
-# Build dataset + train model
-python -m src.ml.train_reconv train \
-  --bench-dir data/bench/ISCAS85 \
-  --dataset data/datasets/reconv_dataset.pkl \
-  --checkpoint-dir checkpoints/reconv_rl \
-  --epochs 50 \
-  --amp \
-  --verbose \
-  --include-hard-negatives
-
-# Evaluate trained model
-python -m src.ml.evaluate_reconv \
-  --checkpoint checkpoints/reconv_rl/best_model.pth \
-  --dataset data/datasets/reconv_dataset.pkl \
-  --verbose
+python -m src.ml.core.dataset \
+    --input /home/local1/cache-cw/reconv_dataset.pkl \
+    --out /home/local1/cache-cw/processed_reconv/ \
+    --max_len 50
 ```
 
-### Documentation
+### 2. Experience Collection
+Generate fresh RL experience by running AI-assisted PODEM on benchmark circuits.
 
-See **[GUIDE.md](GUIDE.md)** for complete training and evaluation documentation.
-
-### Key Components
-
-- **Dataset Builder**: `src/atpg/reconv_podem.py` - Finds and justifies reconvergent structures
-- **Model**: `src/ml/reconv_lib.py` - Multi-path transformer with attention
-- **Trainer**: `src/ml/reconv_rl_trainer.py` - Hybrid supervised + RL training
-- **CLI Tools**: `src/ml/train_reconv.py`, `src/ml/evaluate_reconv.py`
-
-## Minimal Trainer (Supervised Only)
-
-For a lightweight baseline without RL or auto-batch features, use the minimal trainer:
-
-```zsh
-conda activate torch
-
-# Train
-python -m src.ml.train_reconv train \
-  --dataset data/datasets/reconv_dataset.pkl \
-  --output checkpoints/reconv_minimal \
-  --bench-dir data/bench/ISCAS85 \
-  --epochs 5 \
-  --batch-size 8 \
-  --amp \
-  --verbose
-
-# Evaluate
-python -m src.ml.evaluate_reconv \
-  --checkpoint checkpoints/reconv_minimal/best_model.pth \
-  --dataset data/datasets/reconv_dataset.pkl
+```bash
+python -m scripts.collect_experience \
+    --max_faults 100 \
+    --bench_dir data/bench/ISCAS85
 ```
 
-### New Training Arguments
+### 3. Model Training
+Train the transformer using a combination of supervised labels and physics-informed consistency losses.
 
-The training script now supports several additional arguments:
-- `--bench-dir`: Base directory for benchmark files. Paths in the dataset will be resolved relative to this.
-- `--checkpoint-dir`: Alias for `--output`. Sets the directory for saving models.
-- `--amp`: Enables Automatic Mixed Precision (AMP) for faster training and lower memory usage on supported GPUs.
-- `--include-hard-negatives`: Accepted for compatibility; currently placeholder logic for future dataset expansions.
+```bash
+python -m src.ml.train train \
+    --dataset /home/local1/cache-cw/reconv_dataset.pkl \
+    --processed-dir /home/local1/cache-cw/processed_reconv/ \
+    --output checkpoints/reconv_topology_3val_v1_ssd \
+    --epochs 50 \
+    --batch-size 8192 \
+    --lambda-logic 1.0 \
+    --num-workers 8 \
+    --pin-memory \
+    --amp \
+    --ffn-dim 2048 \
+    --model-dim 512 \
+    --enc-layers 3 \
+    --int-layers 3 \
+    --verbose
+```
 
-Notes:
-- Defaults to embedding_dim=128 to match the dummy embedding path (when DeepGate is not available).
-- Expects dataset samples with `info.paths` and optional `justification_1/0` dicts.
+### 4. AI-PODEM Inference & Benchmarking
+Evaluate the model's performance on complete circuits with support for different AI integration levels.
+
+#### Standard Benchmark (Vanilla vs AI)
+Compare standard PODEM against AI-assisted versions (Activation vs Propagation).
+
+```bash
+python -m scripts.benchmark_c432_compare
+```
+
+#### Debug / Single Fault Trace
+Run a deep trace on a specific fault to visualize AI justification steps.
+
+```bash
+python -m scripts.debug_ai_podem_execution \
+    data/bench/ISCAS85/c17.bench \
+    "10-1" \
+    --model checkpoints/reconv_model/best_model.pth
+```
+
+---
+
+## 🏗️ Project Structure
+
+| Component | Path | Description |
+|:---|:---|:---|
+| **Core Logic** | `src/atpg/` | PODEM, Logic Sim, and Reconvergent Solvers |
+| **Model** | `src/ml/core/model.py` | Multi-Path Transformer with Cross-Attention |
+| **Loss** | `src/ml/core/loss.py` | Differentiable Logic Consistency Loss |
+| **Dataset** | `src/ml/core/dataset.py` | Sharded Data Management |
+| **Scripts** | `scripts/` | RL Pipeline and Benchmarking utilities |
+
+---
+
+## 🧪 Environmental Setup
+Ensure you are using the `deepgate` conda environment:
+
+```bash
+conda activate deepgate
+```
+
+For more detailed developer documentation, see **[GUIDE.md](GUIDE.md)**.

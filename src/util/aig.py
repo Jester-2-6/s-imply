@@ -1,9 +1,10 @@
 from typing import List
 
-from src.util.struct import Gate, GateType
 from src.util.io import parse_bench_file, write_bench_file
+from src.util.struct import Gate, GateType
 
 preserve_type = [GateType.INPT, GateType.FROM, GateType.NOT, GateType.AND]
+
 
 def _create_gate(gate_type: int, gate_id: int, fanins: List[int], fanouts: List[int] = []) -> Gate:
     """Helper function to create a gate with proper fanin/fanout counts."""
@@ -12,9 +13,11 @@ def _create_gate(gate_type: int, gate_id: int, fanins: List[int], fanouts: List[
     gate.fot = fanouts
     return gate
 
+
 def _add_gate_to_circuit(new_circuit: List[Gate], gate: Gate) -> None:
     """Helper function to add a gate to the circuit."""
     new_circuit.append(gate)
+
 
 def _convert_or_gate(gate: Gate, new_circuit: List[Gate], next_id: int) -> int:
     """Convert OR gate: OR(a,b) = NOT(AND(NOT(a), NOT(b)))."""
@@ -30,18 +33,21 @@ def _convert_or_gate(gate: Gate, new_circuit: List[Gate], next_id: int) -> int:
     next_id += 1
     and_gate = _create_gate(GateType.AND, next_id, [int(i.name) for i in invs])
     _add_gate_to_circuit(new_circuit, and_gate)
-    
+
     # Set fanouts for NOT gates
     for inv in invs:
         inv.fot = [int(and_gate.name)]
 
     # Create final NOT gate
     next_id += 1
-    final_inv = _create_gate(GateType.NOT, next_id, [int(and_gate.name)], [int(x) for x in gate.fot])
+    final_inv = _create_gate(
+        GateType.NOT, next_id, [int(and_gate.name)], [int(x) for x in gate.fot]
+    )
     _add_gate_to_circuit(new_circuit, final_inv)
     and_gate.fot = [int(final_inv.name)]
-    
+
     return next_id + 1
+
 
 def _convert_nor_gate(gate: Gate, new_circuit: List[Gate], next_id: int) -> int:
     """Convert NOR gate: NOR(a,b) = AND(NOT(a), NOT(b))."""
@@ -55,14 +61,17 @@ def _convert_nor_gate(gate: Gate, new_circuit: List[Gate], next_id: int) -> int:
 
     # Create AND gate for inverted inputs
     next_id += 1
-    and_gate = _create_gate(GateType.AND, next_id, [int(i.name) for i in invs], [int(x) for x in gate.fot])
+    and_gate = _create_gate(
+        GateType.AND, next_id, [int(i.name) for i in invs], [int(x) for x in gate.fot]
+    )
     _add_gate_to_circuit(new_circuit, and_gate)
-    
+
     # Set fanouts for NOT gates
     for inv in invs:
         inv.fot = [int(and_gate.name)]
-    
+
     return next_id
+
 
 def _convert_xor_gate(gate: Gate, new_circuit: List[Gate], next_id: int) -> int:
     """Convert XOR gate: XOR(a,b) = AND(OR(a,b), NAND(a,b))."""
@@ -78,7 +87,7 @@ def _convert_xor_gate(gate: Gate, new_circuit: List[Gate], next_id: int) -> int:
     next_id += 1
     nor_gate = _create_gate(GateType.AND, next_id, [int(i.name) for i in invs])
     _add_gate_to_circuit(new_circuit, nor_gate)
-    
+
     # Set fanouts for NOT gates
     for inv in invs:
         inv.fot = [int(nor_gate.name)]
@@ -88,27 +97,33 @@ def _convert_xor_gate(gate: Gate, new_circuit: List[Gate], next_id: int) -> int:
     or_gate = _create_gate(GateType.NOT, next_id, [int(nor_gate.name)])
     _add_gate_to_circuit(new_circuit, or_gate)
     nor_gate.fot = [int(or_gate.name)]
-    
+
     # Create NAND(a,b) = NOT(AND(a,b))
     next_id += 1
     and_ab_gate = _create_gate(GateType.AND, next_id, gate.fin)
     _add_gate_to_circuit(new_circuit, and_ab_gate)
-    
+
     next_id += 1
     nand_gate = _create_gate(GateType.NOT, next_id, [int(and_ab_gate.name)])
     _add_gate_to_circuit(new_circuit, nand_gate)
     and_ab_gate.fot = [int(nand_gate.name)]
-    
+
     # Create final XOR = AND(OR, NAND)
     next_id += 1
-    xor_gate = _create_gate(GateType.AND, next_id, [int(or_gate.name), int(nand_gate.name)], [int(x) for x in gate.fot])
+    xor_gate = _create_gate(
+        GateType.AND,
+        next_id,
+        [int(or_gate.name), int(nand_gate.name)],
+        [int(x) for x in gate.fot],
+    )
     _add_gate_to_circuit(new_circuit, xor_gate)
-    
+
     # Set fanouts
     or_gate.fot = [int(xor_gate.name)]
     nand_gate.fot = [int(xor_gate.name)]
-    
+
     return next_id
+
 
 def _convert_nand_gate(gate: Gate, new_circuit: List[Gate], next_id: int) -> int:
     """Convert NAND gate: NAND(a,b) = NOT(AND(a,b))."""
@@ -116,51 +131,56 @@ def _convert_nand_gate(gate: Gate, new_circuit: List[Gate], next_id: int) -> int
     next_id += 1
     and_gate = _create_gate(GateType.AND, next_id, gate.fin)
     _add_gate_to_circuit(new_circuit, and_gate)
-    
+
     # Create NOT gate
     next_id += 1
     not_gate = _create_gate(GateType.NOT, next_id, [int(and_gate.name)], [int(x) for x in gate.fot])
     _add_gate_to_circuit(new_circuit, not_gate)
     and_gate.fot = [int(not_gate.name)]
-    
+
     return next_id
+
 
 def _convert_xnor_gate(gate: Gate, new_circuit: List[Gate], next_id: int) -> int:
     """Convert XNOR gate: XNOR(a,b) = NOT(XOR(a,b))."""
     # Use XOR conversion logic
     next_id = _convert_xor_gate(gate, new_circuit, next_id)
-    
+
     # Find the XOR gate (last gate added) and add final NOT
     xor_gate = new_circuit[-1]  # The XOR gate is the last gate added
-    
+
     # Create final NOT for XNOR
     next_id += 1
-    xnor_gate = _create_gate(GateType.NOT, next_id, [int(xor_gate.name)], [int(x) for x in gate.fot])
+    xnor_gate = _create_gate(
+        GateType.NOT, next_id, [int(xor_gate.name)], [int(x) for x in gate.fot]
+    )
     _add_gate_to_circuit(new_circuit, xnor_gate)
     xor_gate.fot = [int(xnor_gate.name)]
-    
+
     return next_id
+
 
 def _convert_buff_gate(gate: Gate, new_circuit: List[Gate], next_id: int) -> int:
     """Convert BUFF gate: BUFF(a) = a (pass-through)."""
     # A buffer is just a pass-through, so we create a direct connection
     # For AIG format, we can treat this as preserving the input directly
     # But we need to maintain the gate structure for fanout handling
-    
+
     # Create a simple pass-through gate (essentially just preserve the input)
     # In AIG, we can represent this as the input itself, but we need to handle fanouts
     # For now, let's create a simple gate that represents the buffer
-    
+
     # Since BUFF is essentially a pass-through, we can just create a gate
     # that connects the input to the output without any logic
     # For simplicity, we'll create a gate that just passes through the input
-    
+
     # Create a simple gate that represents the buffer
     # In practice, this could be optimized away, but for now we'll keep it
     buff_gate = _create_gate(GateType.AND, next_id, gate.fin, [int(x) for x in gate.fot])
     _add_gate_to_circuit(new_circuit, buff_gate)
-    
+
     return next_id + 1
+
 
 def convert_gate(gate: Gate, new_circuit: List[Gate], next_id: int) -> int:
     """Convert a gate to AIG format. Returns the next available ID."""
@@ -171,7 +191,7 @@ def convert_gate(gate: Gate, new_circuit: List[Gate], next_id: int) -> int:
         new_gate.fot = gate.fot.copy()
         new_circuit.append(new_gate)
         return next_id
-    
+
     # Handle gate-specific conversions
     if gate.type == GateType.OR:
         return _convert_or_gate(gate, new_circuit, next_id)
@@ -185,9 +205,10 @@ def convert_gate(gate: Gate, new_circuit: List[Gate], next_id: int) -> int:
         return _convert_xnor_gate(gate, new_circuit, next_id)
     elif gate.type == GateType.BUFF:
         return _convert_buff_gate(gate, new_circuit, next_id)
-    
+
     # If we reach here, the gate type is not supported
     raise ValueError(f"Unsupported gate type: {gate.type}")
+
 
 def _get_output_gate_id(gate_type: int, start_id: int, fanin_count: int) -> int:
     """Calculate the output gate ID for converted gates."""
@@ -201,13 +222,15 @@ def _get_output_gate_id(gate_type: int, start_id: int, fanin_count: int) -> int:
         # NAND: 1 AND + 1 NOT = 2 gates, output is NOT (at start_id + 2)
         return start_id + 2
     elif gate_type == GateType.XOR:
-        # XOR: 2 NOT + 1 AND + 1 NOT + 1 AND + 1 NOT + 1 AND = 7 gates, output is last AND
+        # XOR: 2 NOT + 1 AND + 1 NOT + 1 AND + 1 NOT + 1 AND = 7 gates,
+        # output is last AND
         return start_id + 6
     elif gate_type == GateType.XNOR:
         # XNOR: XOR gates + 1 NOT = 8 gates, output is last NOT
         return start_id + 7
     else:
         return start_id
+
 
 def _update_gate_connections(gates: List[Gate], idx_map: dict) -> None:
     """Update fanin and fanout connections using the mapping."""
@@ -217,17 +240,19 @@ def _update_gate_connections(gates: List[Gate], idx_map: dict) -> None:
         if gate.fot:
             gate.fot = [int(idx_map.get(str(fanout), fanout)) for fanout in gate.fot]
 
+
 def _update_fanout_counts(gates: List[Gate]) -> None:
     """Update fanout counts for all gates."""
     for gate in gates:
         gate.nfo = len(gate.fot) if gate.fot else 0
+
 
 def _topological_sort(gates: List[Gate]) -> List[Gate]:
     """Sort gates in topological order."""
     gate_map = {g.name: g for g in gates}
     visited = set()
     result = []
-    
+
     def visit(gate_name):
         if gate_name in visited:
             return
@@ -238,37 +263,39 @@ def _topological_sort(gates: List[Gate]) -> List[Gate]:
             for fanin in gate.fin:
                 visit(str(fanin))
             result.append(gate)
-    
+
     # Visit all gates
     for gate in gates:
         visit(gate.name)
-    
+
     return result
+
 
 def _renumber_gates(gates: List[Gate]) -> dict:
     """Renumber gates to maintain topological ordering. Returns renumbering map."""
     input_gates = [g for g in gates if g.type == GateType.INPT]
     other_gates = [g for g in gates if g.type != GateType.INPT]
-    
+
     # Sort other gates topologically
     other_gates = _topological_sort(other_gates)
-    
+
     # Create renumbering map
     renumber_map = {}
     for gate in input_gates:
         renumber_map[gate.name] = gate.name  # Keep input IDs unchanged
-    
+
     max_input_id = max(int(g.name) for g in input_gates) if input_gates else 0
     next_new_id = max_input_id + 1
-    
+
     for gate in other_gates:
         old_id = gate.name
         new_id = str(next_new_id)
         renumber_map[old_id] = new_id
         gate.name = new_id
         next_new_id += 1
-    
+
     return renumber_map
+
 
 def bench_to_aig(bench_path: str) -> tuple[List[Gate], dict]:
     """Convert a benchmark file to AIG format."""
@@ -281,7 +308,7 @@ def bench_to_aig(bench_path: str) -> tuple[List[Gate], dict]:
     for node in circuit:
         if node.type > 0:
             original_name = node.name
-            
+
             if node.type in preserve_type:
                 # Preserved gates keep their original name
                 next_id = convert_gate(node, new_circuit, next_id)
@@ -292,26 +319,28 @@ def bench_to_aig(bench_path: str) -> tuple[List[Gate], dict]:
                 next_id = convert_gate(node, new_circuit, next_id)
                 output_gate_id = _get_output_gate_id(node.type, start_id, len(node.fin))
                 idx_map[original_name] = str(output_gate_id)
-    
+
     # Update connections using the mapping
     _update_gate_connections(new_circuit, idx_map)
     _update_fanout_counts(new_circuit)
-    
+
     # Renumber gates for topological ordering
     renumber_map = _renumber_gates(new_circuit)
     _update_gate_connections(new_circuit, renumber_map)
-    
+
     # Update final mapping
     final_idx_map = {}
     for original_id, intermediate_id in idx_map.items():
         final_idx_map[original_id] = renumber_map.get(intermediate_id, intermediate_id)
-    
+
     return new_circuit, final_idx_map
+
 
 def bench_to_aig_file(bench_path: str, aig_path: str):
     new_circuit, idx_map = bench_to_aig(bench_path)
     write_bench_file(new_circuit, aig_path)
     return new_circuit, idx_map
+
 
 if __name__ == "__main__":
     new_circuit, idx_map = bench_to_aig("data/bench/arbitrary/composite_and.bench")

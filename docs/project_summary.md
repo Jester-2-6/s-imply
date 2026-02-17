@@ -4,7 +4,7 @@
 The project addresses the challenge of **back implication prediction** in digital logic circuits. S-Imply (Structural Implication) focuses on **reconvergent path structures**, which are difficult for traditional ATPG algorithms because they require consistent logic assignments across multiple paths that fan out from a common stem and reconverge at a target node.
 
 ## 2. Current Approach
-The project employs a **hybrid Reinforcement Learning (RL) + Supervised Learning** framework designed to "learn the intuition" of Boolean Satisfiability (SAT) over these specific structures.
+The project employs a **differentiable, policy-gradient-style framework** to "learn the intuition" of Boolean Satisfiability (SAT) over these specific structures. While inspired by Reinforcement Learning, it replaces the sparse reward signal of traditional RL with a rich, end-to-end differentiable loss function, enabling more stable and efficient training.
 
 - **Objective**: Learn a policy $\pi(a|s)$ that assigns logic values (0 or 1) to every node of a reconvergent path pair such that:
     1.  **Local Consistency**: All gate logic constraints (AND, OR, NOT, etc.) are satisfied.
@@ -16,23 +16,24 @@ The project employs a **hybrid Reinforcement Learning (RL) + Supervised Learning
 ### A. Model: Multi-Path Transformer (`src/ml/reconv_lib.py`)
 The core model is a hierarchical Transformer designed to process multiple reconvergent paths simultaneously and allow them to exchange information.
 
-1.  **Input Embeddings**:
-    -   **Base Path Embedding**: 132-dimensional vector representing the node's structural role and values.
-    -   **Explicit Gate Type Embedding**: A learnable 64-dimensional vector (`gate_type_emb`) representing the gate type (AND, OR, NOT, etc.), concatenated to the base embedding.
-    -   **Positional Encoding**: Standard sinusoidal encoding to represent the sequential order of gates from stem to reconvergence.
+1.  **Input Embeddings**: The model constructs a rich input representation by concatenating multiple feature vectors.
+    -   **Base Feature Embedding**: An initial feature vector derived from the dataset, including GNN-based embeddings from DeepGate. The dimension is inferred at runtime.
+    -   **Gate Type Embedding**: A learnable 64-dimensional vector (`gate_type_emb`) representing the gate's logical function (AND, OR, NOT, etc.).
+    -   **Node ID Embedding**: A learnable 64-dimensional vector (`node_emb`) representing the physical ID of the gate. This gives the model a strong sense of topological identity, allowing it to distinguish between two different AND gates in the circuit.
+    -   **Positional Encoding**: Standard sinusoidal encoding is applied to the final projected embedding to represent the sequential order of gates along a path.
 2.  **Shared Path Encoder**:
     -   A standard Transformer Encoder (`shared_path_encoder`) that processes each path independently.
     -   Learns local sequential logic features (e.g., "inverter chain" or "control value propagation").
 3.  **Path Interaction Layer**:
-    -   A Transformer Encoder (`path_interaction_layer`) that operates on the **path summary tokens** (the first token of each path).
+    -   A Transformer Encoder (`path_interaction_layer`) that operates on the **path summary tokens** (aggregated from each path via max-pooling).
     -   Enables the model to understand the relationship between different branches (e.g., "Path A produces 0, so Path B must produce 1").
 4.  **Cross-Attention Mechanism**:
     -   A `MultiheadAttention` block (`cross_attn`) where:
-        -   **Query**: Individual node representations.
+        -   **Query**: Individual node representations from the shared path encoder.
         -   **Key/Value**: The set of interaction-aware path summaries.
-    -   Allows every node in every path to attend to the global context of the reconvergent structure.
+    -   Allows every node in every path to attend to the global context of the entire reconvergent structure.
 5.  **Prediction Heads**:
-    -   **Logic Head**: A linear layer mapping node representations to logits for Logic 0 and Logic 1.
+    -   **Logic Head**: A linear layer mapping final node representations to logits for Logic 0 and Logic 1.
     -   **Solvability Head**: A global linear head that predicts whether the entire structure is SAT or UNSAT (Solvable vs Impossible) based on the pooled interaction vector.
 
 ### B. Solver & ATPG Logic (`src/atpg/reconv_podem.py`)
@@ -52,18 +53,21 @@ Instead of a purely generative approach, the system relies on algorithmic solver
     -   Utilizes LRR boundaries to prune justification queues, keeping the solver focused on Primary Inputs (PIs) and Exit Lines that directly influence the target reconvergence result.
 
 ### C. Training Pipeline (`src/ml/train_reconv.py`)
-The training uses a REINFORCE-based policy gradient approach with auxiliary losses to guide the model towards valid assignments.
+The training pipeline is designed for end-to-end differentiable training of the policy using the **Gumbel-Softmax estimator**. This technique allows gradients to flow through the discrete 0/1 sampling process, enabling the direct optimization of logic consistency.
 
--   **Loss Function (`policy_loss_and_metrics`)**:
-    1.  **REINFORCE Loss**: Maximizes expected reward.
-        -   **Reward Signal**: +1.0 for valid assignments (all constraints met), negative penalty proportional to errors otherwise.
-    2.  **Weighted Soft Edge Constraints**: Differentiable penalty (`soft_edge_lambda`) for violations of local gate logic.
-        -   **Class Balancing**: Uses a **12.0x weight** for NOT gate violations to counter their statistical rarity (<5% of dataset) and prevent "buffer bias".
-    3.  **Reconvergence Consistency**: Penalty for variance in the predicted values at the reconvergence node.
-    4.  **Anchor Support**:
-        -   **Anchor Injection**: Procedurally injects a "target" value (Logic 0 or 1) at the reconvergence node input to guide the model.
-        -   **Anchor Reward**: Bonus for predicting the injected anchor value correctly.
-    5.  **Entropy Regularization**: Encourages exploration (`entropy_beta`).
+-   **Loss Function (`reinforce_loss`)**: The total loss is a weighted sum of multiple components designed to guide the model towards logically valid assignments.
+    1.  **Differentiable Logic Losses**: The primary learning signal. Instead of a sparse reward, the model is penalized for logic violations directly.
+        -   **Soft Edge Loss (`soft_edge_lambda`)**: A differentiable penalty based on the Gumbel-Softmax probabilities for violations of local gate logic. Uses a **20.0x weight** for NOT/BUFF gate violations to counter their statistical rarity and deterministic nature.
+        -   **Full Path Logic Loss (`lambda_full_logic`)**: An auxiliary loss that penalizes all edge-level gate logic violations along the entire path.
+    2.  **Reconvergence Consistency Loss**: An MSE-based penalty on the logits at the reconvergence node to ensure all paths predict the same value.
+    3.  **Anchor Supervision Loss**: A standard Cross-Entropy loss that trains the model to predict a pre-verified "anchor" value at a specific node, providing a strong supervised signal for solvable (SAT) cases.
+    4.  **Constrained Curriculum Loss**: A Cross-Entropy loss applied to a subset of nodes that are temporarily "constrained" with ground-truth values from a full logic simulation.
+    5.  **Solvability Loss**: A weighted Cross-Entropy loss for the auxiliary `solvability_head`, which predicts whether a structure is SAT or UNSAT.
+    6.  **Entropy Regularization (`entropy_beta`)**: Encourages exploration by penalizing overly confident (low-entropy) probability distributions.
+
+-   **Curriculum Learning**: The training process incorporates several curriculum strategies to ease the model into the complex task.
+    -   **Constrained Curriculum**: When enabled (`--constrained_curriculum`), the training follows a schedule where the first **25%** of epochs are constraint-free, after which the probability of applying ground-truth constraints ramps up linearly to `max_constraint_prob` over the remaining **75%** of epochs.
+    -   **Length Curriculum**: The dataset can be filtered by maximum path length (`--max-len`), allowing the model to be trained on shorter, easier problems first.
 
 ### D. DeepGate Integration (`src/ml/gcn.py`)
 The project integrates **DeepGate**, a Graph Neural Network (GNN)-based model, to provide high-fidelity circuit embeddings.
@@ -93,11 +97,13 @@ The project integrates **DeepGate**, a Graph Neural Network (GNN)-based model, t
 ## 5. Metrics & Validation
 The following metrics are used to evaluate model performance:
 -   **`valid_rate`**: The percentage of samples where the model generates a fully valid justification (0 edge violations, consistent stem/reconvergence).
--   **`edge_acc`**: The percentage of local gate input/output relations that are satisfied.
+-   **`edge_acc`**: The percentage of local gate input/output relations that are satisfied across all paths.
+-   **`constraint_violation_rate`**: The percentage of nodes that violate their ground-truth values when the constrained curriculum is active.
 -   **`reconv_match_rate`**: The percentage of samples where all paths predict the same value for the reconvergence node.
--   **`anchor_match_rate`**: How often the model satisfies the injected anchor constraint.
+-   **`anchor_match_rate`**: How often the model satisfies the injected anchor constraint for solvable (SAT) cases.
 -   **`solv_acc`**: Accuracy of predicting whether a target is logically solvable (SAT) or impossible (UNSAT).
--   **`false_unsat_rate`**: The frequency of incorrectly giving up on solvable targets.
+-   **`false_unsat_rate`**: The frequency of incorrectly predicting UNSAT for a solvable case.
+-   **`true_unsat_rate`**: The frequency of correctly identifying an UNSAT case.
 
 ## 6. Experimental Results
 ### A. SAT/UNSAT Consistency (Maamari Update)
@@ -138,3 +144,10 @@ Diagnostic analysis of 185-epoch trained model revealed NOT gates as sole failur
 -   **Complex Reconvergence**: Scaling from pair-wise paths to N-ary reconvergent structures.
 -   **Integration with Commercial ATPG**: Using the model's predictions as high-quality initial heuristics for industry-standard ATPG tools.
 -   **Remaining Edge Errors (~3.2%)**: Post-processing fixes NOT/BUFF but AND/OR/NAND/NOR inequality violations remain. Consider iterative refinement or autoregressive decoding for further improvement.
+
+### D. Training Pipeline Repair & Optimization
+**Timestamp: 2026-02-17**
+Resolved critical pipeline failures and implemented SSD-optimized data loading:
+-   **Lazy Loading (`ReconvergentPathsDataset`)**: Implemented on-demand shard loading to handle massive datasets without exhausting RAM. The dataset now loads only metadata initially and fetches tensor data from disk-cached shards during iteration.
+-   **Pipeline Stabilization**: Fixed circular dependencies and missing helper functions (`_generate_anchor`, `resolve_gate_types`) that were causing `ImportError` failures in `src.ml.train`.
+-   **Performance**: Optimized `gate_mapping` conversion with integer-key pre-checks, reducing initialization time. Multi-worker data loading verified to work correctly with lazy loading logic.

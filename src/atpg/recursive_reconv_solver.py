@@ -11,31 +11,33 @@ from __future__ import annotations
 
 import abc
 import collections
-from typing import List, Dict, Any, Optional, Set, Tuple
-import heapq
+from typing import Any, Dict, List, Optional, Set, Tuple
 
-from src.util.struct import LogicValue, Gate
 from src.atpg.reconv_podem import PathConsistencySolver
+from src.util.struct import Gate, GateType, LogicValue
+
 
 class ReconvPairPredictor(abc.ABC):
     """Abstract base class for predicting solutions to reconvergent pairs."""
-    
+
     @abc.abstractmethod
     def predict(
-        self, 
-        pair_info: Dict[str, Any], 
+        self,
+        pair_info: Dict[str, Any],
         constraints: Dict[int, LogicValue],
-        seed: Optional[int] = None
-    ) -> List[Dict[int, LogicValue]]:
+        seed: Optional[int] = None,
+    ) -> List[Dict[int, LogicValue]] | Tuple[List[Dict[int, LogicValue]], Any]:
         """
         Predict a list of valid assignments for the given pair, respecting constraints.
-        
+
         Args:
             pair_info: Dictionary containing 'start', 'reconv', 'paths', etc.
             constraints: Dictionary of current node assignments {node_id: value}.
-            
+            seed: Optional random seed for deterministic sampling.
+
         Returns:
-            A list of assignment dictionaries (partial solutions).
+            A list of assignment dictionaries (partial solutions) OR
+            (list of assignment dictionaries, snapshot information).
             The list is ordered by likelihood/preference.
         """
         pass
@@ -47,92 +49,89 @@ class HierarchicalReconvSolver:
     ordered from shortest to longest.
     """
 
-    def __init__(self, circuit: List[Gate], predictor: ReconvPairPredictor, recorder = None, verbose: bool = False):
+    def __init__(
+        self,
+        circuit: List[Gate],
+        predictor: ReconvPairPredictor,
+        recorder=None,
+        verbose: bool = False,
+    ):
         self.circuit = circuit
         self.predictor = predictor
         self.recorder = recorder
         self.verbose = verbose
         # Helper for consistency checks, reused from existing codebase
         self.consistency_checker = PathConsistencySolver(circuit)
-        
+
         # Populate fanout lists from fanin (if not already present)
         self._populate_fanouts()
+        self.pair_cache = {}  # Cache reconv pairs per root node
 
-    def solve(self, target_node: int, target_val: LogicValue, constraints: Dict[int, LogicValue] = None, seed: Optional[int] = None) -> Optional[Dict[int, LogicValue]]:
+    def solve(
+        self,
+        target_node: int,
+        target_val: LogicValue,
+        constraints: Dict[int, LogicValue] = None,
+        seed: Optional[int] = None,
+    ) -> Optional[Dict[int, LogicValue]]:
         """
         Main entry point. Tries to justify target_node = target_val.
-        
-        1. Identify logic cone of target_node.
-        2. Find and sort reconvergent pairs within the cone.
-        3. Recursively solve pairs (backtracking).
-        4. Return final assignment or None.
         """
         if self.verbose:
-            print(f"[Solver] Solving for Gate {target_node} = {target_val} with {len(constraints) if constraints else 0} constraints")
-            
-        # 1. & 2. Find relevant pairs
-        pairs = self._collect_and_sort_pairs(target_node)
-        
+            print(
+                f"[Solver] Solving for Gate {target_node} = {target_val} with "
+                f"{len(constraints) if constraints else 0} constraints"
+            )
+
+        # 1. & 2. Find relevant pairs (use cache to avoid redundant BFS)
+        if target_node not in self.pair_cache:
+            self.pair_cache[target_node] = self._collect_and_sort_pairs(target_node)
+        pairs = self.pair_cache[target_node]
+
         if self.verbose:
             print(f"[Solver] Found {len(pairs)} reconvergent pairs")
-        
+
         # Initial constraints: target + provided constraints
         initial_constraints = {}
         if constraints:
             initial_constraints.update(constraints)
-        
-        # Set/Overwrite target requirement (critical!)
+
+        # Set/Overwrite target requirement
         initial_constraints[target_node] = target_val
-        
+
         # 3. Recursive Solve
         final_assignment = self._solve_recursive(0, pairs, initial_constraints, seed)
-        
+
         return final_assignment
 
     def _collect_and_sort_pairs(self, root_node: int) -> List[Dict[str, Any]]:
-        """
-        Identify reconvergent pairs in the transitive fanin of root_node,
-        sorted by their proximity to the fault and path complexity.
-        
-        Priority: Pairs closer to the fault site (shorter distance from reconv to target)
-        and with shorter total path lengths should be solved first.
-        """
-        # A. Transitive Fanin Cone
+        """Identify and sort reconvergent pairs in the transitive fanin of root_node."""
         cone_nodes = self._get_transitive_fanin(root_node)
-        
-        # B. Find Pairs within this cone
         pairs = self._find_pairs_in_set(cone_nodes)
-        
-        # C. Compute distance from reconvergence node to target for each pair
-        # BFS from root_node backwards to find distance
+
         from collections import deque
+
         distances = {root_node: 0}
         queue = deque([root_node])
-        
+
         while queue:
             curr = queue.popleft()
             curr_dist = distances[curr]
             gate = self.circuit[curr]
-            fanins = getattr(gate, 'fin', []) or []
-            
-            for fin in fanins:
+            if gate is None:
+                continue
+            for fin in gate.fin:
                 if fin in cone_nodes and fin not in distances:
                     distances[fin] = curr_dist + 1
                     queue.append(fin)
-        
-        # D. Sort by priority:
-        # Combined Score = Total Path Length + Distance to Target
-        # This prioritizes compact loops near the fault over distant small loops.
-        # Secondary sort by length ensures shortest paths are picked within similar distances.
+
         def pair_cost(p):
-            reconv_node = p['reconv']
+            reconv_node = p["reconv"]
             dist_to_target = distances.get(reconv_node, 9999)
-            total_path_len = len(p['paths'][0]) + len(p['paths'][1])
-            # Return tuple: (Combined Score, Length)
+            total_path_len = len(p["paths"][0]) + len(p["paths"][1])
             return (total_path_len + dist_to_target, total_path_len)
-            
+
         pairs.sort(key=pair_cost)
-        
         return pairs
 
     def _get_transitive_fanin(self, root: int) -> Set[int]:
@@ -143,6 +142,8 @@ class HierarchicalReconvSolver:
         while queue:
             curr = queue.popleft()
             gate = self.circuit[curr]
+            if gate is None:
+                continue
             for fin in gate.fin:
                 if fin not in seen:
                     seen.add(fin)
@@ -151,234 +152,313 @@ class HierarchicalReconvSolver:
 
     def _populate_fanouts(self):
         """Build fanout lists from fanin relationships if not present."""
-        # Initialize empty fanout lists
         for gate in self.circuit:
-            if not hasattr(gate, 'fot') or gate.fot is None:
+            if gate is None:
+                continue
+            if not hasattr(gate, "fot") or gate.fot is None:
                 gate.fot = []
-        
-        # Build fanouts from fanins
+
         for gate_id, gate in enumerate(self.circuit):
+            if gate is None:
+                continue
             for fin_id in gate.fin:
                 if fin_id < len(self.circuit):
-                    if gate_id not in self.circuit[fin_id].fot:
-                        self.circuit[fin_id].fot.append(gate_id)
+                    target_gate = self.circuit[fin_id]
+                    if target_gate is None:
+                        continue
+                    if not hasattr(target_gate, "fot") or target_gate.fot is None:
+                        target_gate.fot = []
+                    if gate_id not in target_gate.fot:
+                        target_gate.fot.append(gate_id)
 
     def _find_pairs_in_set(self, allowed_nodes: Set[int]) -> List[Dict[str, Any]]:
-        """
-        Find reconvergent pairs where all path nodes are in allowed_nodes.
-        Simplified BFS-based detection.
-        """
-        # Identify potential stems: nodes in allowed_nodes with multiple fanouts also in allowed_nodes
+        """Find reconvergent pairs within a set of allowed nodes."""
         stems = []
         for nid in allowed_nodes:
             gate = self.circuit[nid]
-            valid_fot = [fo for fo in (getattr(gate, 'fot', []) or []) if fo in allowed_nodes]
+            if gate is None:
+                continue
+            valid_fot = [fo for fo in (getattr(gate, "fot", []) or []) if fo in allowed_nodes]
             if len(valid_fot) >= 2:
                 stems.append(nid)
-                
+
         results = []
-        
-        # For each stem, launch BFS to find reconvergence points within allowed_nodes
         for s in stems:
-            # We track which branch (index in valid_fot) reached a node
             start_gate = self.circuit[s]
-            valid_fot = [fo for fo in (getattr(start_gate, 'fot', []) or []) if fo in allowed_nodes]
-            
-            # Track reported reconvergence nodes for this stem to avoid duplicates
+            valid_fot = [fo for fo in (getattr(start_gate, "fot", []) or []) if fo in allowed_nodes]
             reported_reconvs = set()
-            
-            # reached[node] = {branch_idx: path_list}
-            reached = {} 
-            
-            # Initial frontier
+            reached = {}
             queue = collections.deque()
             for i, fo in enumerate(valid_fot):
-                path = [s, fo]
-                reached.setdefault(fo, {})
-                reached[fo][i] = path
+                reached[fo] = {i: [s, fo]}
                 queue.append(fo)
-                
-            processed_nodes = {s} # Avoid cycles back to start
-            
-            # Limit search depth roughly
+
             while queue:
                 curr = queue.popleft()
-                
-                # Check if this node is a reconvergence point for S
-                # i.e., reached by >= 2 distinct branches
                 if len(reached[curr]) >= 2 and curr != s:
-                    # Found a pair!
-                    # Extract pairs. If >2 branches, we can take all combinations or just first 2.
-                    # Taking first 2 distinct branches for simplicity.
-                    bs = list(reached[curr].keys())
-                    b1, b2 = bs[0], bs[1]
-                    p1 = reached[curr][b1]
-                    p2 = reached[curr][b2]
-                    
-                    # Avoid duplicates? (s, curr)
-                    # We add to results if not already reported for this stem.
                     if curr not in reported_reconvs:
                         reported_reconvs.add(curr)
-                        results.append({
-                            'start': s,
-                            'reconv': curr,
-                            'branches': [valid_fot[b1], valid_fot[b2]], # Branch specific nodes
-                            'paths': [p1, p2]
-                        })
-                    
-                    # Do we continue from here? Yes, might reach further reconvergence.
-                    
-                # Expand
+                        bs = list(reached[curr].keys())
+                        results.append(
+                            {
+                                "start": s,
+                                "reconv": curr,
+                                "branches": [valid_fot[bs[0]], valid_fot[bs[1]]],
+                                "paths": [reached[curr][bs[0]], reached[curr][bs[1]]],
+                            }
+                        )
+
                 gate = self.circuit[curr]
                 curr_branches = reached[curr].keys()
-                
-                valid_fot_curr = [fo for fo in (getattr(gate, 'fot', []) or []) if fo in allowed_nodes]
-                
+                valid_fot_curr = [
+                    fo for fo in (getattr(gate, "fot", []) or []) if fo in allowed_nodes
+                ]
+
                 for fo in valid_fot_curr:
-                    if fo == s: continue 
-                    
-                    # Need to merge branch info
+                    if fo == s:
+                        continue
                     if fo not in reached:
                         reached[fo] = {}
-                        new_visit = True
-                    else:
-                        new_visit = False
-                        
                     changed = False
                     for b_idx in curr_branches:
                         if b_idx not in reached[fo]:
-                            # Extend path
-                            old_path = reached[curr][b_idx]
-                            new_path = old_path + [fo]
-                            reached[fo][b_idx] = new_path
+                            reached[fo][b_idx] = reached[curr][b_idx] + [fo]
                             changed = True
-                            
                     if changed:
-                        # If we added info, we must propagate, even if visited before (DAG)
-                        # To avoid infinite loops in cyclic circuits we might need checks, but Bench circuits are usually DAGs.
-                        # Simple optimization: only append if not already in queue? Set based queue?
-                        # For now, just append.
                         queue.append(fo)
-
-        # Post-processing: remove partial overlaps or duplicates if needed
-        # For now, return all found.
         return results
 
     def _solve_recursive(
-        self, 
-        pair_idx: int, 
-        pairs: List[Dict[str, Any]], 
+        self,
+        pair_idx: int,
+        pairs: List[Dict[str, Any]],
         current_constraints: Dict[int, LogicValue],
-        seed: Optional[int] = None
+        seed: Optional[int] = None,
     ) -> Optional[Dict[int, LogicValue]]:
-        """
-        Backtracking solver.
-        
-        Args:
-            pair_idx: Index of the pair we are currently solving.
-            pairs: Sorted list of all pairs.
-            current_constraints: Assignments made so far.
-            
-        Returns:
-            Full assignment dictionary if solvable, None otherwise.
-        """
-        # Base Case: All pairs processed
+        """Backtracking solver with AI prediction support."""
         if pair_idx >= len(pairs):
             if self.verbose:
-                print(f"[Solver] Base case reached. Returning partial solution.")
-            return current_constraints
-        
+                print("[Solver] Base case: justifying remaining requirements...")
+            return self._justify_all(current_constraints)
+
         pair = pairs[pair_idx]
+        indent = "  " * (pair_idx + 1)
         if self.verbose:
-            indent = "  " * (pair_idx + 1)
-            stem = pair.get('start', pair.get('stem'))
-            print(f"[Solver]{indent} Processing Pair {pair_idx}: Stem {stem} -> Reconv {pair['reconv']}")
-        
-        # Get candidate solutions from Oracle
-        # The predictor should return solutions that respect `current_constraints`.
-        
-        # UPDATE: Predictor now returns (candidates, inputs_snapshot)
-        # Derive a unique seed for this step if a base seed is provided
+            stem = pair.get("start", pair.get("stem"))
+            print(f"[Solver]{indent} Solving Pair {pair_idx}: Stem {stem} -> {pair['reconv']}")
+
         step_seed = None
         if seed is not None:
-             # simple mixing: seed + pair_idx (could be more complex if needed)
-             step_seed = (seed + pair_idx * 7919) % 2147483647
-             
+            step_seed = (seed + pair_idx * 7919) % 2147483647
+
         prediction_result = self.predictor.predict(pair, current_constraints, seed=step_seed)
-        
-        # Handle backward compatibility if someone hasn't updated their predictor class
         inputs_snapshot = None
         if isinstance(prediction_result, tuple):
-             candidates, inputs_snapshot = prediction_result
+            candidates, inputs_snapshot = prediction_result
         else:
-             candidates = prediction_result
-        
+            candidates = prediction_result
+
         if not candidates:
-            if self.verbose:
-                indent = "  " * (pair_idx + 1)
-                print(f"[Solver]{indent} No candidates from predictor. Backtracking.")
-            # If the model cannot find any solution for this pair given constraints,
-            # this path is dead. Backtrack.
             return None
-            
+
         for i, assignment_part in enumerate(candidates):
-            if self.verbose:
-                indent = "  " * (pair_idx + 1)
-                print(f"[Solver]{indent} Trying Candidate {i}: {assignment_part}")
-                
-            # Log this decision attempt if recording
             step_record = None
             if self.recorder and inputs_snapshot:
-                 # Log the attempt. 
-                 step_record = self.recorder.log_step(
-                     node_ids=inputs_snapshot['node_ids'],
-                     mask_valid=inputs_snapshot['mask_valid'],
-                     gate_types=inputs_snapshot['gate_types'],
-                     files=inputs_snapshot['files'],
-                     pair_info=pair,
-                     selected_assignment=assignment_part
-                 )
+                step_record = self.recorder.log_step(
+                    node_ids=inputs_snapshot["node_ids"],
+                    mask_valid=inputs_snapshot["mask_valid"],
+                    gate_types=inputs_snapshot["gate_types"],
+                    files=inputs_snapshot["files"],
+                    pair_info=pair,
+                    selected_assignment=assignment_part,
+                )
 
-            # 1. Merge assignment
-            # (Logic consistency is assumed enforced by predictor, but we can double check)
             new_constraints = current_constraints.copy()
             conflict = False
             for k, v in assignment_part.items():
-                if k in new_constraints:
-                    if new_constraints[k] != v:
-                        conflict = True
-                        break
-                else:
-                    new_constraints[k] = v
-            
+                if not self._check_global_consistency(k, v, new_constraints):
+                    conflict = True
+                    break
+                new_constraints[k] = v
+
             if conflict:
-                if self.verbose:
-                    print(f"[Solver]{indent} Conflict detected. Skipping candidate.")
                 if step_record and self.recorder:
-                     # Immediate conflict -> local failure
-                     self.recorder.mark_backtrack(penalty=-0.5) 
+                    self.recorder.mark_backtrack(penalty=-0.5)
                 continue
-                
-            # 2. Recurse
+
             result = self._solve_recursive(pair_idx + 1, pairs, new_constraints, seed)
-            
             if result is not None:
-                if self.verbose:
-                    print(f"[Solver]{indent} Candidate {i} successful.")
-                # Found a valid complete assignment!
                 return result
-            
-            # If we returned None, it means a conflict happened deeper in the recursion.
-            # This choice (assignment_part) led to a failure.
-            if self.verbose:
-                print(f"[Solver]{indent} Candidate {i} failed in recursion. Backtracking.")
-                
+
             if step_record and self.recorder:
-                 self.recorder.mark_backtrack(penalty=-0.5)
-                 
-        # If no candidates lead to a solution, backtrack.
-        if self.verbose:
-            indent = "  " * (pair_idx + 1)
-            print(f"[Solver]{indent} All candidates failed. Backtracking pair {pair_idx}.")
+                self.recorder.mark_backtrack(penalty=-0.5)
+
         return None
 
+    def _justify_all(self, assignment: Dict[int, LogicValue]) -> Optional[Dict[int, LogicValue]]:
+        """Justify all current assignments back to primary inputs."""
+        full_assignment = assignment.copy()
+        queue = [n for n in full_assignment if self.circuit[n].type != GateType.INPT]
+
+        while queue:
+            node = queue.pop(0)
+            val = full_assignment[node]
+            reqs = self._justify_gate(node, val, full_assignment)
+            if reqs is None:
+                return None
+
+            for fin, fval in reqs.items():
+                if fin not in full_assignment:
+                    full_assignment[fin] = fval
+                    if self.circuit[fin].type != GateType.INPT:
+                        queue.append(fin)
+                elif full_assignment[fin] != fval:
+                    return None
+        return full_assignment
+
+    def _check_global_consistency(
+        self, node: int, val: LogicValue, assignment: Dict[int, LogicValue]
+    ) -> bool:
+        if node in assignment:
+            return assignment[node] == val
+        gate = self.circuit[node]
+        if gate.fin:
+            input_vals = [assignment.get(fin, LogicValue.XD) for fin in gate.fin]
+            if any(v != LogicValue.XD for v in input_vals):
+                computed = self._compute_gate_robust(gate.type, input_vals)
+                if computed != LogicValue.XD and computed != val:
+                    return False
+        for fout in getattr(gate, "fot", []) or []:
+            if fout in assignment:
+                fout_gate = self.circuit[fout]
+                fout_val = assignment[fout]
+                input_vals = [
+                    val if fin == node else assignment.get(fin, LogicValue.XD)
+                    for fin in fout_gate.fin
+                ]
+                computed = self._compute_gate_robust(fout_gate.type, input_vals)
+                if computed != LogicValue.XD and computed != fout_val:
+                    return False
+        return True
+
+    def _justify_gate(
+        self, node: int, val: LogicValue, assignment: Dict[int, LogicValue]
+    ) -> Optional[Dict[int, LogicValue]]:
+        gate = self.circuit[node]
+        unassigned = [fin for fin in gate.fin if fin not in assignment]
+        if not unassigned:
+            input_vals = [assignment[fin] for fin in gate.fin]
+            res = self._compute_simple(gate.type, input_vals)
+            return {} if res == val else None
+
+        input_vals_partial = [assignment.get(fin, LogicValue.XD) for fin in gate.fin]
+        computed = self._compute_gate_robust(gate.type, input_vals_partial)
+        if computed != LogicValue.XD and computed != val:
+            return None
+        if computed == val:
+            return {}
+
+        reqs = {}
+        if gate.type == GateType.AND:
+            if val == LogicValue.ONE:
+                for fin in unassigned:
+                    reqs[fin] = LogicValue.ONE
+            else:
+                for fin in unassigned:
+                    if self._check_global_consistency(fin, LogicValue.ZERO, assignment):
+                        reqs[fin] = LogicValue.ZERO
+                        break
+                else:
+                    return None
+        elif gate.type == GateType.NAND:
+            if val == LogicValue.ZERO:
+                for fin in unassigned:
+                    reqs[fin] = LogicValue.ONE
+            else:
+                for fin in unassigned:
+                    if self._check_global_consistency(fin, LogicValue.ZERO, assignment):
+                        reqs[fin] = LogicValue.ZERO
+                        break
+                else:
+                    return None
+        elif gate.type == GateType.OR:
+            if val == LogicValue.ZERO:
+                for fin in unassigned:
+                    reqs[fin] = LogicValue.ZERO
+            else:
+                for fin in unassigned:
+                    if self._check_global_consistency(fin, LogicValue.ONE, assignment):
+                        reqs[fin] = LogicValue.ONE
+                        break
+                else:
+                    return None
+        elif gate.type == GateType.NOR:
+            if val == LogicValue.ONE:
+                for fin in unassigned:
+                    reqs[fin] = LogicValue.ZERO
+            else:
+                for fin in unassigned:
+                    if self._check_global_consistency(fin, LogicValue.ONE, assignment):
+                        reqs[fin] = LogicValue.ONE
+                        break
+                else:
+                    return None
+        elif gate.type == GateType.NOT:
+            reqs[gate.fin[0]] = LogicValue.ZERO if val == LogicValue.ONE else LogicValue.ONE
+        elif gate.type == GateType.BUFF:
+            reqs[gate.fin[0]] = val
+        else:
+            return None
+
+        for r_node, r_val in reqs.items():
+            if not self._check_global_consistency(r_node, r_val, assignment):
+                return None
+        return reqs
+
+    def _compute_simple(self, gtype: int, inputs: List[LogicValue]) -> LogicValue:
+        if gtype == GateType.AND:
+            return LogicValue.ONE if all(i == LogicValue.ONE for i in inputs) else LogicValue.ZERO
+        if gtype == GateType.NAND:
+            return LogicValue.ZERO if all(i == LogicValue.ONE for i in inputs) else LogicValue.ONE
+        if gtype == GateType.OR:
+            return LogicValue.ONE if any(i == LogicValue.ONE for i in inputs) else LogicValue.ZERO
+        if gtype == GateType.NOR:
+            return LogicValue.ZERO if any(i == LogicValue.ONE for i in inputs) else LogicValue.ONE
+        if gtype == GateType.NOT:
+            return LogicValue.ZERO if inputs[0] == LogicValue.ONE else LogicValue.ONE
+        if gtype == GateType.BUFF:
+            return inputs[0]
+        return LogicValue.XD
+
+    def _compute_gate_robust(self, gtype: int, inputs: List[LogicValue]) -> LogicValue:
+        if gtype == GateType.AND:
+            if any(i == LogicValue.ZERO for i in inputs):
+                return LogicValue.ZERO
+            if all(i == LogicValue.ONE for i in inputs):
+                return LogicValue.ONE
+            return LogicValue.XD
+        elif gtype == GateType.NAND:
+            if any(i == LogicValue.ZERO for i in inputs):
+                return LogicValue.ONE
+            if all(i == LogicValue.ONE for i in inputs):
+                return LogicValue.ZERO
+            return LogicValue.XD
+        elif gtype == GateType.OR:
+            if any(i == LogicValue.ONE for i in inputs):
+                return LogicValue.ONE
+            if all(i == LogicValue.ZERO for i in inputs):
+                return LogicValue.ZERO
+            return LogicValue.XD
+        elif gtype == GateType.NOR:
+            if any(i == LogicValue.ONE for i in inputs):
+                return LogicValue.ZERO
+            if all(i == LogicValue.ZERO for i in inputs):
+                return LogicValue.ONE
+            return LogicValue.XD
+        elif gtype == GateType.NOT:
+            if inputs[0] == LogicValue.XD:
+                return LogicValue.XD
+            return LogicValue.ZERO if inputs[0] == LogicValue.ONE else LogicValue.ONE
+        elif gtype == GateType.BUFF:
+            return inputs[0]
+        return LogicValue.XD

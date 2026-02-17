@@ -1,5 +1,5 @@
+from typing import List
 
-from typing import List, Dict, Optional
 from src.util.struct import Gate, GateType, LogicValue
 
 # Logic Tables
@@ -20,6 +20,7 @@ OR_TABLE = [
 ]
 
 NOT_TABLE = [1, 0, 2, 4, 3]
+
 
 def compute_gate_value(circuit: List[Gate], g: Gate) -> int:
     """Compute the logic value of a gate based on its inputs."""
@@ -61,6 +62,7 @@ def compute_gate_value(circuit: List[Gate], g: Gate) -> int:
         return NOT_TABLE[XOR_TABLE[a][b]]
     return LogicValue.XD
 
+
 XOR_TABLE = [
     [0, 1, 2, 3, 4],
     [1, 0, 2, 4, 3],
@@ -69,30 +71,40 @@ XOR_TABLE = [
     [4, 3, 2, 1, 0],
 ]
 
+
 class DFrontier:
     def __init__(self):
         self.gates = []
+
     def add(self, gate_id):
         if gate_id not in self.gates:
             self.gates.append(gate_id)
+
     def remove(self, gate_id):
         if gate_id in self.gates:
             self.gates.remove(gate_id)
+
     def is_empty(self):
         return len(self.gates) == 0
+
     def get_first(self):
         return self.gates[0] if self.gates else None
+
     def clear(self):
         self.gates = []
+
     def sort(self, key_func):
         self.gates.sort(key=key_func)
+
 
 d_frontier = DFrontier()
 _dist_map = {}
 
+
 def set_d_frontier_sort(distance_map):
     global _dist_map
     _dist_map = distance_map
+
 
 def logic_sim(circuit: List[Gate], total_gates: int, fault=None, topo_order=None) -> None:
     """Logic simulation. Uses topo_order for single-pass if provided."""
@@ -106,9 +118,9 @@ def logic_sim(circuit: List[Gate], total_gates: int, fault=None, topo_order=None
                     elif fault.value == LogicValue.DB and g.val == LogicValue.ZERO:
                         g.val = LogicValue.DB
                 continue
-            
+
             new_val = compute_gate_value(circuit, g)
-            
+
             if fault and i == fault.gate_id:
                 if fault.value == LogicValue.D and new_val == LogicValue.ONE:
                     new_val = LogicValue.D
@@ -130,20 +142,21 @@ def logic_sim(circuit: List[Gate], total_gates: int, fault=None, topo_order=None
                             g.val = LogicValue.D
                         elif fault.value == LogicValue.DB and g.val == LogicValue.ZERO:
                             g.val = LogicValue.DB
-                    if g.val != old_val: changed = True
+                    if g.val != old_val:
+                        changed = True
                     continue
-                
+
                 new_val = compute_gate_value(circuit, g)
                 if fault and i == fault.gate_id:
                     if fault.value == LogicValue.D and new_val == LogicValue.ONE:
                         new_val = LogicValue.D
                     elif fault.value == LogicValue.DB and new_val == LogicValue.ZERO:
                         new_val = LogicValue.DB
-                
+
                 if new_val != old_val:
                     g.val = new_val
                     changed = True
-    
+
     # Update D-frontier
     d_frontier.clear()
     for i in range(1, total_gates + 1):
@@ -155,16 +168,19 @@ def logic_sim(circuit: List[Gate], total_gates: int, fault=None, topo_order=None
     if _dist_map:
         d_frontier.sort(key_func=lambda gid: _dist_map.get(gid, 999999))
 
+
 def logic_sim_and_impl(circuit: List[Gate], total_gates: int, fault, assignment) -> None:
     if assignment and assignment.gate_id != -1:
         circuit[assignment.gate_id].val = assignment.value
     logic_sim(circuit, total_gates, fault)
+
 
 def reset_gates(circuit: List[Gate], total_gates: int) -> None:
     for i in range(total_gates + 1):
         if circuit[i]:
             circuit[i].val = LogicValue.XD
     d_frontier.clear()
+
 
 def fault_is_at_po(circuit: List[Gate], total_gates: int) -> bool:
     """Check if any primary output has a fault value (D or DB)."""
@@ -174,11 +190,12 @@ def fault_is_at_po(circuit: List[Gate], total_gates: int) -> bool:
                 return True
     return False
 
+
 def print_pi(circuit: List[Gate], total_gates: int) -> str:
     """Returns string represention of PI values."""
     res = []
     # Map logic values: 0->0, 1->1, 2->X, 3(D)->1, 4(DB)->0
-    val_map = {0: '0', 1: '1', 2: 'X', 3: '1', 4: '0'}
+    val_map = {0: "0", 1: "1", 2: "X", 3: "1", 4: "0"}
     for i in range(1, total_gates + 1):
         if circuit[i].type == GateType.INPT:
             val = int(circuit[i].val)

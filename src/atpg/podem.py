@@ -5,28 +5,37 @@ MODIFIED to support MLP PPO (stage1), GCN PPO (stage2), and GCN PPO + RND (stage
 
 import sys
 import time
-from typing import List, Tuple, Optional, Callable  # ...updated (added Optional, Any, Callable)
 from collections import defaultdict
-
-from src.util.struct import (
-    Gate,
-    Fault,
-    LogicValue,
-    GateType,
+from typing import (  # ...updated (added Optional, Any, Callable)
+    Callable,
+    List,
+    Optional,
 )
+
+import src.atpg.logic_sim_three as logic_sim
 from src.atpg.logic_sim_three import (
-    logic_sim_and_impl,
+    d_frontier,
     fault_is_at_po,
     print_pi,
-    d_frontier,
     set_d_frontier_sort,
 )
-import src.atpg.logic_sim_three as logic_sim
 from src.atpg.scoap import calculate_scoap
 from src.atpg.util import (
-    get_x_fanin,
     calculate_distance_to_primary_inputs,
     calculate_distance_to_primary_outputs,
+    get_x_fanin,
+)
+from src.util.io import (
+    get_gate_type_str as get_gate_type_name,
+)
+from src.util.io import (
+    parse_bench_file,
+)
+from src.util.struct import (
+    Fault,
+    Gate,
+    GateType,
+    LogicValue,
 )
 
 # Set maximum recursion depth
@@ -111,22 +120,24 @@ def _trace(msg: str) -> None:
     if TRACE_DECISIONS:
         print(msg)
 
+
 def initialize(circuit: List[Gate], total_gates: int):
     global gate_distances_back, gate_distances_fwd
 
     gate_distances_back = calculate_distance_to_primary_inputs(circuit, total_gates)
     gate_distances_fwd = calculate_distance_to_primary_outputs(circuit, total_gates)
-    
+
     # Reset all gate values to X to prevent state pollution from previous runs
     for i in range(1, total_gates + 1):
         circuit[i].val = LogicValue.XD
+
 
 def podem(
     circuit: List[Gate],
     fault: Fault,
     total_gates: int,
     backtrace_func: Optional[Callable] = None,
-    timeout: float = float("inf")
+    timeout: float = float("inf"),
 ) -> bool:
     """Entry point for PODEM algorithm."""
     global \
@@ -142,10 +153,10 @@ def podem(
         podem_start_time, \
         podem_timeout, \
         topological_order
-        
+
     podem_start_time = time.time()
     podem_timeout = timeout
-    
+
     # Reset per-run statistics (backtrack counts, etc.)
     reset_statistics()
 
@@ -155,7 +166,7 @@ def podem(
         calculate_scoap(circuit, total_gates)
         scoap_calculated = True
         topological_order = get_topological_order(circuit, total_gates)
-        
+
     # Clear distance maps to force recalculation for each circuit
     gate_distances_back.clear()
     gate_distances_fwd.clear()
@@ -178,7 +189,7 @@ def podem(
         set_d_frontier_sort(gate_distances_fwd)
     except Exception:
         pass
-   
+
     # Recurse
     result = podem_recursion(circuit, total_gates, fault)
 
@@ -196,7 +207,8 @@ def podem(
         fault_label = "D" if fault.value == LogicValue.D else "DB"
         if VERBOSE:
             print(
-                f"Fault failed (code={result}): gate_id={fault.gate_id} gate_type={gate_type_name} fault={fault_label}"
+                f"Fault failed (code={result}): gate_id={fault.gate_id} "
+                f"gate_type={gate_type_name} fault={fault_label}"
             )
         return result
 
@@ -206,14 +218,21 @@ def podem(
 
 def podem_recursion(circuit: List[Gate], total_gates: int, fault: Fault) -> int:
     """Core PODEM recursion."""
-    global depth, total_recursive_calls, backtrack_count, podem_start_time, podem_timeout, topological_order, backtrace_function
+    global \
+        depth, \
+        total_recursive_calls, \
+        backtrack_count, \
+        podem_start_time, \
+        podem_timeout, \
+        topological_order, \
+        backtrace_function
     depth += 1
     total_recursive_calls += 1
-    
+
     # Backtrack limit to prevent hanging
     if backtrack_count > 100000:
         return BACKTRACK_LIMIT
-        
+
     # Wall-clock timeout
     if (time.time() - podem_start_time) > podem_timeout:
         return TIMEOUT
@@ -233,7 +252,7 @@ def podem_recursion(circuit: List[Gate], total_gates: int, fault: Fault) -> int:
 
         pi_id = pi_assignment.gate_id
         desired_val = pi_assignment.value
-        
+
         # Try desired value
         circuit[pi_id].val = desired_val
         logic_sim.logic_sim(circuit, total_gates, fault, topo_order=topological_order)
@@ -242,7 +261,7 @@ def podem_recursion(circuit: List[Gate], total_gates: int, fault: Fault) -> int:
             return SUCCESS
         if res != UNTESTABLE:
             return res
-            
+
         # Backtrack: try flipped value
         circuit[pi_id].val = 1 - desired_val
         logic_sim.logic_sim(circuit, total_gates, fault, topo_order=topological_order)
@@ -250,8 +269,8 @@ def podem_recursion(circuit: List[Gate], total_gates: int, fault: Fault) -> int:
         if res == SUCCESS:
             return SUCCESS
         if res != UNTESTABLE:
-             return res
-            
+            return res
+
         # Reset PI and return failure
         circuit[pi_id].val = LogicValue.XD
         logic_sim.logic_sim(circuit, total_gates, fault, topo_order=topological_order)
@@ -267,7 +286,7 @@ def backtrace_wrapper(objective: Fault, circuit: List[Gate]) -> Fault:
 
     backtrace_count += 1
 
-    return backtrace_function(objective, circuit) # type: ignore
+    return backtrace_function(objective, circuit)  # type: ignore
 
 
 # ---------- Simple backtrace & helpers ----------
@@ -285,9 +304,7 @@ def simple_backtrace(objective: Fault, circuit: List[Gate]) -> Fault:
 
     while current_gate.nfi != 0:
         backtrace_hops += 1
-        _trace(
-            f"[sb] at gate {current_gate_id} type {get_gate_type_name(current_gate.type)}"
-        )
+        _trace(f"[sb] at gate {current_gate_id} type " f"{get_gate_type_name(current_gate.type)}")
 
         x_fanins = []
 
@@ -338,14 +355,13 @@ def get_objective(circuit: List[Gate], fault: Fault) -> Fault:
         d_frontier_gate = d_frontier.get_first()
         if d_frontier_gate is not None:
             objective.value = get_non_controlling_value(circuit, d_frontier_gate)
-            objective.gate_id = get_x_fanin(
-                circuit, d_frontier_gate, gate_distances_back
-            )
+            objective.gate_id = get_x_fanin(circuit, d_frontier_gate, gate_distances_back)
             if objective.gate_id == -1:
                 return Fault(-1, -1)
 
         _trace(
-            f"[obj] fault site is D/DB -> objective gate {objective.gate_id} value {objective.value}"
+            "[obj] fault site is D/DB -> objective gate "
+            f"{objective.gate_id} value {objective.value}"
         )
         return objective
 
@@ -355,7 +371,8 @@ def get_objective(circuit: List[Gate], fault: Fault) -> Fault:
     objective.gate_id = fault.gate_id
     objective.value = LogicValue.ONE if fault.value == LogicValue.D else LogicValue.ZERO
     _trace(
-        f"[obj] fault site is not D/DB -> objective gate {objective.gate_id} value {objective.value}"
+        "[obj] fault site is not D/DB -> objective gate "
+        f"{objective.gate_id} value {objective.value}"
     )
     return objective
 
@@ -376,86 +393,17 @@ def get_non_controlling_value(circuit, gate_id: int | None) -> int:
         return 0
 
 
-# ---------- Parser & utility (unchanged) ----------
-def parse_bench_file(filename: str) -> Tuple[List[Gate], int]:
-    circuit: List[Gate] = []
-    max_node_id = 0
-    inputs, outputs, gates = [], [], []
-    with open(filename, "r") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if line.startswith("INPUT("):
-                node_id = int(line[6:-1])
-                inputs.append(node_id)
-                max_node_id = max(max_node_id, node_id)
-            elif line.startswith("OUTPUT("):
-                node_id = int(line[7:-1])
-                outputs.append(node_id)
-                max_node_id = max(max_node_id, node_id)
-            elif "=" in line:
-                parts = line.split("=")
-                node_id = int(parts[0].strip())
-                gate_def = parts[1].strip()
-                gate_type_str = gate_def.split("(")[0].strip()
-                inputs_str = gate_def.split("(")[1].split(")")[0]
-                input_ids = [int(x.strip()) for x in inputs_str.split(",")]
-                gates.append((node_id, gate_type_str, input_ids))
-                max_node_id = max(max_node_id, node_id)
-    circuit = [Gate() for _ in range(max_node_id + 1)]
-    for node_id in inputs:
-        circuit[node_id] = Gate(str(node_id), GateType.INPT, 0, 0, 0, LogicValue.XD)
-    for node_id, gate_type_str, input_ids in gates:
-        gate_type = get_gate_type(gate_type_str)
-        circuit[node_id] = Gate(
-            str(node_id), gate_type, len(input_ids), 0, 0, LogicValue.XD
-        )
-        circuit[node_id].fin = input_ids
-        for input_id in input_ids:
-            if circuit[input_id].fot is None:
-                circuit[input_id].fot = []
-            circuit[input_id].fot.append(node_id)
-    # Set fanout counts
-    for i in range(1, max_node_id + 1):
-        if circuit[i].fot is None:
-            circuit[i].fot = []
-        circuit[i].nfo = len(circuit[i].fot)
-    # Mark outputs (nodes with no fanouts)
-    for node_id in outputs:
-        circuit[node_id].nfo = 0
-    return circuit, max_node_id
-
-
-def get_gate_type(gate_type_str: str) -> int:
-    gate_type_map = {
-        "BUFF": GateType.BUFF,
-        "NOT": GateType.NOT,
-        "AND": GateType.AND,
-        "NAND": GateType.NAND,
-        "OR": GateType.OR,
-        "NOR": GateType.NOR,
-        "XOR": GateType.XOR,
-        "XNOR": GateType.XNOR,
-    }
-    return gate_type_map.get(gate_type_str.upper(), GateType.INPT)
-
-
 def get_all_faults(circuit: List[Gate], total_gates: int) -> List[Fault]:
-    """Generate all possible stuck-at faults for the circuit."""
+    """
+    Generate Stuck-at-0 and Stuck-at-1 faults for every gate in the circuit.
+    """
     faults = []
-    for gate_id in range(1, total_gates + 1):
-        if circuit[gate_id].type != 0:
-            faults.append(Fault(gate_id, LogicValue.D))  # SA0
-            faults.append(Fault(gate_id, LogicValue.DB))  # SA1
+    # Skip index 0 (if used as placeholder)
+    for i in range(1, total_gates + 1):
+        if circuit[i] and circuit[i].type != 0:
+            faults.append(Fault(i, LogicValue.ZERO))
+            faults.append(Fault(i, LogicValue.ONE))
     return faults
-
-
-def get_gate_type_name(gate_type: int) -> str:
-    try:
-        return GateType(gate_type).name
-    except ValueError:
-        return f"UNKNOWN({gate_type})"
 
 
 # -------------------- Minimal CLI runner --------------------
@@ -476,7 +424,10 @@ if __name__ == "__main__":
 
     for k in range(10000):
         for i, fault in enumerate(faults, 1):
-            print(f"\"\n[PODEM] Processing fault #{i}: gate_id={fault.gate_id} value={'D' if fault.value == LogicValue.D else 'DB'}")
+            print(
+                f"\"\n[PODEM] Processing fault #{i}: gate_id={fault.gate_id} "
+                f"value={'D' if fault.value == LogicValue.D else 'DB'}"
+            )
             detected = podem(circuit, fault, total_gates)
             succ += 1 if detected else 0
             fail += 0 if detected else 1

@@ -1,4 +1,5 @@
 from typing import List, Tuple
+
 from src.util.struct import Gate, GateType, LogicValue
 
 __all__ = ["parse_bench_file"]
@@ -17,6 +18,7 @@ def get_gate_type(gate_type_str: str) -> int:
     }
     return gate_type_map.get(gate_type_str.upper(), GateType.INPT)
 
+
 def get_gate_type_str(gate_type: int) -> str:
     gate_type_map = {
         GateType.BUFF: "BUFF",
@@ -28,7 +30,8 @@ def get_gate_type_str(gate_type: int) -> str:
         GateType.XOR: "XOR",
         GateType.XNOR: "XNOR",
     }
-    return gate_type_map.get(gate_type, "INPT") # type: ignore
+    return gate_type_map.get(gate_type, "INPT")  # type: ignore
+
 
 def parse_bench_file(filename: str) -> Tuple[List[Gate], int]:
     circuit: List[Gate] = []
@@ -63,9 +66,7 @@ def parse_bench_file(filename: str) -> Tuple[List[Gate], int]:
         circuit[node_id].fot = []
     for node_id, gate_type_str, input_ids in gates:
         gate_type = get_gate_type(gate_type_str)
-        circuit[node_id] = Gate(
-            str(node_id), gate_type, len(input_ids), 0, 0, LogicValue.XD
-        )
+        circuit[node_id] = Gate(str(node_id), gate_type, len(input_ids), 0, 0, LogicValue.XD)
         circuit[node_id].fin = input_ids
         circuit[node_id].fot = []
         for input_id in input_ids:
@@ -91,11 +92,15 @@ def write_bench_file(circuit: List[Gate], filename: str) -> None:
                 f.write(f"INPUT({node.name})\n")
             elif node.nfo == 0:
                 # Write both gate definition and OUTPUT for output gates
-                f.write(f"{node.name} = {get_gate_type_str(node.type)}({','.join([str(x) for x in node.fin])})\n")
+                f.write(
+                    f"{node.name} = {get_gate_type_str(node.type)}("
+                    f"{','.join([str(x) for x in node.fin])})\n"
+                )
                 f.write(f"OUTPUT({node.name})\n")
             else:
                 f.write(
-                    f"{node.name} = {get_gate_type_str(node.type)}({','.join([str(x) for x in node.fin])})\n"
+                    f"{node.name} = {get_gate_type_str(node.type)}("
+                    f"{','.join([str(x) for x in node.fin])})\n"
                 )
 
 

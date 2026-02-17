@@ -57,14 +57,21 @@ class Gate:
         self.co = -1  # Observability
 
     def __str__(self):
-        return f"Gate(name={self.name}, type={self.type}, nfi={self.nfi}, nfo={self.nfo}, mark={self.mark}, val={self.val}, fin={self.fin}, fot={self.fot}, cc0={self.cc0}, cc1={self.cc1}, co={self.co})"
+        return (
+            f"Gate(name={self.name}, type={self.type}, nfi={self.nfi}, "
+            f"nfo={self.nfo}, mark={self.mark}, val={self.val}, "
+            f"fin={self.fin}, fot={self.fot}, cc0={self.cc0}, "
+            f"cc1={self.cc1}, co={self.co})"
+        )
 
     def __repr__(self):
         return self.__str__()
+
 
 class Fault:
     def __init__(self, gate_id: int, value: int):
         self.gate_id = gate_id
         self.value = value
+
     def __repr__(self):
         return f"Fault(gate_id={self.gate_id}, value={self.value})"

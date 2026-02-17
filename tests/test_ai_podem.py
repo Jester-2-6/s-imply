@@ -1,14 +1,16 @@
-
-import sys
 import os
+import sys
 import unittest
 from unittest.mock import MagicMock, patch
 
 sys.path.append(os.getcwd())
 
-from src.util.struct import Gate, GateType, LogicValue, Fault
-from src.atpg.ai_podem import ai_podem, ModelPairPredictor, HierarchicalReconvSolver, AIBacktracer
-from src.atpg import podem
+from src.atpg.ai_podem import (
+    AIBacktracer,
+    ai_podem,
+)
+from src.util.struct import Fault, Gate, GateType, LogicValue
+
 
 # Mock circuit
 def create_mock_circuit():
@@ -18,8 +20,8 @@ def create_mock_circuit():
     circuit[2] = Gate("2", GateType.INPT, 0, 1)
     circuit[3] = Gate("3", GateType.AND, 2, 0)
     circuit[3].fin = [1, 2]
-    circuit[4] = Gate("4", GateType.NOT, 1, 0) 
-    
+    circuit[4] = Gate("4", GateType.NOT, 1, 0)
+
     circuit[1].fot = [3]
     circuit[2].fot = [3]
     circuit[1].val = LogicValue.XD
@@ -27,50 +29,62 @@ def create_mock_circuit():
 
     return circuit, 3
 
+
 class TestAIPodem(unittest.TestCase):
-    
-    @patch('src.atpg.ai_podem.ModelPairPredictor')
-    @patch('src.atpg.ai_podem.HierarchicalReconvSolver')
-    @patch('src.atpg.ai_podem.mogu_podem_wrapper')
+    @patch("src.atpg.ai_podem.ModelPairPredictor")
+    @patch("src.atpg.ai_podem.HierarchicalReconvSolver")
+    @patch("src.atpg.ai_podem.mogu_podem_wrapper")
     def test_ai_podem_fallback(self, mock_podem, mock_solver_cls, mock_predictor_cls):
         """Test that ai_podem falls back if AI fails."""
         circuit, total_gates = create_mock_circuit()
-        fault = Fault(3, LogicValue.D) 
-        
+        fault = Fault(3, LogicValue.D)
+
         mock_solver_instance = mock_solver_cls.return_value
-        mock_solver_instance.solve.return_value = None # AI Fails
-        
-        mock_podem.return_value = True 
-        
-        result = ai_podem(circuit, fault, total_gates, circuit_path="dummy.bench", enable_ai_activation=True)
-        
+        mock_solver_instance.solve.return_value = None  # AI Fails
+
+        mock_podem.return_value = True
+
+        result = ai_podem(
+            circuit,
+            fault,
+            total_gates,
+            circuit_path="dummy.bench",
+            enable_ai_activation=True,
+        )
+
         self.assertTrue(result)
         mock_solver_instance.solve.assert_called_once()
-        # Should call mogu_podem_wrapper 
+        # Should call mogu_podem_wrapper
         mock_podem.assert_called_once()
 
-    @patch('src.atpg.ai_podem.ModelPairPredictor')
-    @patch('src.atpg.ai_podem.HierarchicalReconvSolver')
-    @patch('src.atpg.ai_podem.mogu_podem_wrapper')
+    @patch("src.atpg.ai_podem.ModelPairPredictor")
+    @patch("src.atpg.ai_podem.HierarchicalReconvSolver")
+    @patch("src.atpg.ai_podem.mogu_podem_wrapper")
     def test_ai_propagation_only(self, mock_podem, mock_solver_cls, mock_predictor_cls):
         """Test enablement of AI Propagation without Activation."""
         circuit, total_gates = create_mock_circuit()
         fault = Fault(3, LogicValue.D)
-        
+
         mock_podem.return_value = True
-        
+
         # Disable AI Activation, Enable AI Propagation
-        ai_podem(circuit, fault, total_gates, circuit_path="dummy.bench", 
-                 enable_ai_activation=False, enable_ai_propagation=True)
-        
+        ai_podem(
+            circuit,
+            fault,
+            total_gates,
+            circuit_path="dummy.bench",
+            enable_ai_activation=False,
+            enable_ai_propagation=True,
+        )
+
         # Solver should NOT be called for activation constraint (step 1)
         mock_solver_instance = mock_solver_cls.return_value
         mock_solver_instance.solve.assert_not_called()
-        
+
         # But 'mogu_podem_wrapper' should be called with a backtrace_func
         args, kwargs = mock_podem.call_args
-        self.assertIsNotNone(kwargs.get('backtrace_func'))
-        self.assertIsInstance(kwargs.get('backtrace_func'), AIBacktracer)
+        self.assertIsNotNone(kwargs.get("backtrace_func"))
+        self.assertIsInstance(kwargs.get("backtrace_func"), AIBacktracer)
         print("\nTest AI Prop Only: OK")
 
     def test_ai_backtracer_logic(self):
@@ -78,18 +92,18 @@ class TestAIPodem(unittest.TestCase):
         circuit, total_gates = create_mock_circuit()
         solver = MagicMock()
         solver.circuit = circuit
-        
+
         backtracer = AIBacktracer(solver)
-        
+
         # Case 1: AI Solver finds assignment for Gate 1=1 to satisfy objective
         solver.solve.return_value = {1: LogicValue.ONE}
-        
+
         objective = Fault(3, LogicValue.ONE)
         res = backtracer(objective, circuit)
-        
+
         self.assertEqual(res.gate_id, 1)
         self.assertEqual(res.value, LogicValue.ONE)
-        
+
         # Case 2: AI Solver fails -> Fallback to simple
         solver.solve.return_value = None
         # Should fallback to simple_backtrace.
@@ -99,5 +113,6 @@ class TestAIPodem(unittest.TestCase):
         self.assertIn(res.gate_id, [1, 2])
         print("\nTest AI Backtracer Logic: OK")
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     unittest.main()
