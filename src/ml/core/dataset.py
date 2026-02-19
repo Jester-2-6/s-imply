@@ -53,8 +53,10 @@ class ReconvergentPathsDataset(Dataset):
         load_processed: bool = False,
         add_logic_value: bool = True,
         anchor_in_dataset: bool = False,
+        inject_constraints: bool = False,
+        constraint_prob: float = 0.5,
         max_len_filter: int = 0,
-        cache_size: int = 10,
+        cache_size: int = 1,
     ):
         self.dataset_path = dataset_path
         self.device = device
@@ -64,6 +66,8 @@ class ReconvergentPathsDataset(Dataset):
         self.load_processed = load_processed
         self.add_logic_value = add_logic_value
         self.anchor_in_dataset = anchor_in_dataset
+        self.inject_constraints = inject_constraints
+        self.constraint_prob = constraint_prob
         self.max_len_filter = max_len_filter
         self.cache_size = cache_size
         self._prefer_value = int(prefer_value)
@@ -71,8 +75,7 @@ class ReconvergentPathsDataset(Dataset):
         # Disable processed mode if filtering is active (for simplicity)
         if self.max_len_filter > 0 and self.load_processed:
             print(
-                f"Disabling load_processed because max_len_filter="
-                f"{self.max_len_filter} is active."
+                f"Disabling load_processed because max_len_filter={self.max_len_filter} is active."
             )
             self.load_processed = False
 
@@ -102,19 +105,22 @@ class ReconvergentPathsDataset(Dataset):
                     f"[WARNING] No shards found in {self.processed_dir}. Will fallback to pickle."
                 )
                 self._use_processed = False
-        else:
-            self._use_processed = False
+        # Decide if we need to load the raw pickle (for the 'info' dictionaries)
+        # Even if using processed shards, we need 'info' for the solver (inject_constraints)
+        self.need_pickle_info = (not self._use_processed) or self.inject_constraints
 
-        # Fallback: load raw pickle dataset
-        if not getattr(self, "_use_processed", False):
+        # Load raw pickle dataset if needed
+        if self.need_pickle_info:
             import time
 
-            print(f"Loading raw pickle dataset from {dataset_path}...", flush=True)
+            print(f"Loading metadata/info from {dataset_path}...", flush=True)
             start_time = time.time()
             with open(dataset_path, "rb") as f:
                 self.data = pickle.load(f)
             elapsed = time.time() - start_time
-            print(f"Pickle loaded in {elapsed:.2f}s", flush=True)
+            # Only print this from main process to avoid log spam
+            if os.getpid() == getattr(self, "_main_pid", 0) or getattr(self, "_main_pid", 0) == 0:
+                print(f"Dataset pickle loaded in {elapsed:.2f}s", flush=True)
 
             # Pre-convert gate_mapping keys to integers for all samples
             # Pre-convert gate_mapping keys to integers for all samples
@@ -232,14 +238,28 @@ class ReconvergentPathsDataset(Dataset):
         raise IndexError(f"Index {idx} out of range for dataset of size {self._total_len}")
 
     def _ensure_shard_loaded(self, shard_idx: int):
-        """Lazy load shard with LRU caching."""
+        """Lazy load shard with LRU caching and RAM awareness."""
         if shard_idx in self._shard_cache:
             # Move to end (most recently used)
             self._shard_cache.move_to_end(shard_idx)
             return
 
+        import gc
+
+        import psutil
+
+        # MEMORY AWARENESS: If system RAM is critical, clear local cache before loading more
+        mem = psutil.virtual_memory()
+        if mem.percent > 90.0:
+            # Clear everything to be safe
+            self._shard_cache.clear()
+            gc.collect()
+            print(
+                f"[RECONV-MEM] RAM critical ({mem.percent}%). "
+                f"Worker {os.getpid()} cleared shard cache."
+            )
+
         # Load new shard
-        # print(f"\r[Dataset] Loading shard {shard_idx} from disk...", flush=True, end="")
         path = self._shard_files[shard_idx]
         try:
             data = torch.load(path, map_location="cpu")
@@ -260,199 +280,196 @@ class ReconvergentPathsDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         """Get a single dataset item."""
-        # Fast path: load from preprocessed shards
+        # Step 1: Initialize metadata containers
+        final_info = None
+        p_sel, l_sel, v_sel, s_sel = -1, -1, -1, 0
+
+        # Step 2: Load core tensors from Fast Path (shards) or Slow Path (pickle)
         if getattr(self, "_use_processed", False):
+            # FAST PATH: Shards
             shard_idx, local_idx = self._get_shard_for_idx(idx)
             self._ensure_shard_loaded(shard_idx)
             data = self._shard_cache.get(shard_idx)
-
             if data is None:
-                raise RuntimeError(
-                    f"Shard data is None! idx={idx} shard={shard_idx} "
-                    f"in_cache={shard_idx in self._shard_cache} pid={os.getpid()}"
-                )
+                raise RuntimeError(f"Shard data is None! shard={shard_idx}")
 
-            # Access data from the loaded shard dictionary
-            # Note: We move to device here
             paths_emb = data["paths_emb"][local_idx].to(torch.float32).to(self.device)
             attn_mask = data["attn_mask"][local_idx].to(self.device)
             node_ids = data["node_ids"][local_idx].to(self.device)
             file_path = data["files"][local_idx]
+            gate_types = data.get("gate_types", torch.full_like(node_ids, -1))[local_idx].to(
+                self.device
+            )
 
-            gate_types = None
-            if "gate_types" in data:
-                gate_types = data["gate_types"][local_idx].to(self.device)
-            else:
-                gate_types = torch.full_like(node_ids, -1)
-
-            # Optional anchors
-            if self.anchor_in_dataset and "anchor_p" in data:
-                # Check if anchor exists for this sample (legacy check on tensor vs None)
-                # In tensor form, we just read it.
-                # Assuming data is dict of tensors.
+            if "anchor_p" in data:
                 p_sel = int(data["anchor_p"][local_idx].item())
                 l_sel = int(data["anchor_l"][local_idx].item())
                 v_sel = int(data["anchor_v"][local_idx].item())
                 s_sel = int(data["solvability"][local_idx].item())
 
-                if p_sel >= 0 and l_sel >= 0 and self.add_logic_value and paths_emb.shape[-1] >= 3:
-                    D = paths_emb.shape[-1]
-                    onehot = torch.tensor([1.0, 0.0, 0.0], device=self.device)
-                    if v_sel == 1:
-                        onehot = torch.tensor([0.0, 1.0, 0.0], device=self.device)
-                    paths_emb[p_sel, l_sel, D - 3 : D] = onehot
-
-                return {
-                    "paths_emb": paths_emb,
-                    "attn_mask": attn_mask,
-                    "node_ids": node_ids,
-                    "file": file_path,
-                    "anchor_p": torch.tensor(p_sel, dtype=torch.long, device=self.device),
-                    "anchor_l": torch.tensor(l_sel, dtype=torch.long, device=self.device),
-                    "anchor_v": torch.tensor(v_sel, dtype=torch.long, device=self.device),
-                    "solvability": torch.tensor(s_sel, dtype=torch.long, device=self.device),
-                    "gate_types": gate_types,
-                }
-
-            return {
-                "paths_emb": paths_emb,
-                "attn_mask": attn_mask,
-                "node_ids": node_ids,
-                "file": file_path,
-                "gate_types": gate_types,
-            }
-
-        entry = self.data[idx]
-
-        # Extract data from entry
-        file_path = entry["file"]
-        info = entry["info"]
-
-        # Check if this is a new-format dataset with embeddings
-        has_embeddings = "struct_emb" in entry and "gate_mapping" in entry
-
-        if has_embeddings:
-            struct_emb = entry["struct_emb"]  # [N, D] embeddings for all nodes
-            entry["gate_mapping"]  # original_id -> aig_id
+            # For constraint solving, we need the original 'info' dict.
+            # Shards don't store the full 'info' dict to save space.
+            # We must load it from the pickle/fallback if constraints are needed.
+            if self.inject_constraints or not self.anchor_in_dataset:
+                if hasattr(self, "data") and idx < len(self.data):
+                    final_info = self.data[idx]["info"]
         else:
-            # Old format without embeddings - generate dummy embeddings
-            struct_emb = None
+            # SLOW PATH: Pickle
+            entry = self.data[idx]
+            file_path = entry["file"]
+            info = entry["info"]
+            final_info = info
+            has_embeddings = "struct_emb" in entry and "gate_mapping" in entry
+            struct_emb = entry.get("struct_emb")
+            gate_mapping_int = entry.get("_gate_mapping_int", {})
+            paths = info["paths"]
+            P = len(paths)
+            D = struct_emb.shape[1] if (has_embeddings and struct_emb is not None) else 128
+            D_total = D + 3 if self.add_logic_value else D
+            max_len = max(len(p) for p in paths)
+            L = min(max_len, self.max_path_length)
 
-        # Get the paths (list of lists of node IDs)
-        paths = info["paths"]  # [[node_id, ...], [node_id, ...]]
-        P = len(paths)
+            # Use float16 to save 50% RAM while on CPU/Disk
+            paths_emb = torch.zeros(P, L, D_total, dtype=torch.float16, device=self.device)
+            attn_mask = torch.zeros(P, L, dtype=torch.bool, device=self.device)
+            node_ids = torch.zeros(P, L, dtype=torch.long, device=self.device)
+            gate_types = torch.full((P, L), -1, dtype=torch.long, device=self.device)
+            if self.add_logic_value:
+                paths_emb[..., -1] = 1.0  # Initialize to Unknown [0, 0, 1]
 
-        # Determine embedding dimension
-        if has_embeddings and struct_emb is not None:
-            D = struct_emb.shape[1] if len(struct_emb.shape) > 1 else struct_emb.shape[0]
-        else:
-            D = 128  # Default embedding dimension
+            circuit = self._load_circuit_cached(file_path)
+            # Re-resolve unique nodes for this sample
+            unique_nodes = {nid for path in paths for nid in path[:L] if nid > 0}
+            node_info = {}
+            for nid in unique_nodes:
+                gty = int(circuit[nid].type) if nid < len(circuit) else -1
+                emb = struct_emb[gate_mapping_int[nid]] if nid in gate_mapping_int else None
+                if emb is None:
+                    emb = torch.zeros(D) if has_embeddings else torch.randn(D)
+                node_info[nid] = (gty, emb)
 
-        # Add 3 dimensions for one-hot logic value (0, 1, X) if enabled
-        if self.add_logic_value:
-            D_total = D + 3
-        else:
-            D_total = D
+            for p, path in enumerate(paths):
+                for pos in range(min(len(path), L)):
+                    nid = path[pos]
+                    if nid <= 0:
+                        continue
+                    node_ids[p, pos], attn_mask[p, pos] = nid, True
+                    gty, emb = node_info[nid]
+                    gate_types[p, pos], paths_emb[p, pos, :D] = gty, emb
 
-        # Find max path length in this sample
-        max_len = max(len(path) for path in paths)
-        L = min(max_len, self.max_path_length)
+            if self.anchor_in_dataset:
+                p_sel, l_sel, v_sel, s_sel = self._gen_anchor_for_sample(
+                    node_ids, attn_mask, file_path, info
+                )
 
-        # Initialize tensors
-        paths_emb = torch.zeros(P, L, D_total, dtype=torch.float32, device=self.device)
-        attn_mask = torch.zeros(P, L, dtype=torch.bool, device=self.device)
-        node_ids = torch.zeros(P, L, dtype=torch.long, device=self.device)
-        gate_types = torch.full((P, L), -1, dtype=torch.long, device=self.device)
-
-        # Initialize logic values to "Unknown" (Phase 3: [0, 0, 1]) in a single op
-        if self.add_logic_value:
-            paths_emb[..., -1] = 1.0
-
-        # Cache circuit for gate type lookup
-        circuit = self._load_circuit_cached(file_path)
-        circuit_len = len(circuit)
-
-        # Pre-resolve unique nodes in this sample to avoid repeated expensive lookups
-        unique_nodes = set()
-        for path in paths:
-            for nid in path[:L]:
-                if nid > 0:
-                    unique_nodes.add(nid)
-
-        # Optimized lookup table for this sample
-        node_info = {}
-        gate_mapping_int = entry.get("_gate_mapping_int", {})
-
-        for nid in unique_nodes:
-            gty = -1
-            if nid < circuit_len:
-                gty = int(circuit[nid].type)
-
-            emb = None
-            if has_embeddings and struct_emb is not None:
-                aig_id = gate_mapping_int.get(nid)
-                if aig_id is not None and aig_id < struct_emb.shape[0]:
-                    emb = struct_emb[aig_id]
-
-            if emb is None:
-                if has_embeddings:
-                    emb = torch.zeros(D, dtype=torch.float32)
-                else:
-                    emb = torch.randn(D, dtype=torch.float32)
-
-            # Ensure emb is a tensor on the correct device
-            if not isinstance(emb, torch.Tensor):
-                emb = torch.tensor(emb, dtype=torch.float32)
-
-            node_info[nid] = (gty, emb)
-
-        # Fill tensors using the optimized lookup
-        for p, path in enumerate(paths):
-            path_len = min(len(path), L)
-            for pos in range(path_len):
-                nid = path[pos]
-                if nid <= 0:
-                    continue
-
-                node_ids[p, pos] = nid
-                attn_mask[p, pos] = True
-
-                gty, emb = node_info[nid]
-                gate_types[p, pos] = gty
-                paths_emb[p, pos, :D] = emb
-
-        # Optionally integrate anchor hint at dataset level
-        if self.anchor_in_dataset:
-            p_sel, l_sel, v_sel, s_sel = self._gen_anchor_for_sample(
-                node_ids, attn_mask, file_path, info
+        # Step 3: Apply anchor hint if present/generated
+        if self.add_logic_value and p_sel >= 0 and l_sel >= 0:
+            D = paths_emb.shape[-1]
+            onehot = torch.tensor(
+                [1.0, 0.0, 0.0] if v_sel == 0 else [0.0, 1.0, 0.0], device=self.device
             )
-            if p_sel >= 0 and l_sel >= 0 and self.add_logic_value and paths_emb.shape[-1] >= 3:
-                D = paths_emb.shape[-1]
-                onehot = torch.tensor([1.0, 0.0, 0.0], device=self.device)
-                if v_sel == 1:
-                    onehot = torch.tensor([0.0, 1.0, 0.0], device=self.device)
-                paths_emb[p_sel, l_sel, D - 3 : D] = onehot
-            return {
-                "paths_emb": paths_emb,
-                "attn_mask": attn_mask,
-                "node_ids": node_ids,
-                "gate_types": gate_types,
-                "file": file_path,
-                "anchor_p": torch.tensor(p_sel, dtype=torch.long, device=self.device),
-                "anchor_l": torch.tensor(l_sel, dtype=torch.long, device=self.device),
-                "anchor_v": torch.tensor(v_sel, dtype=torch.long, device=self.device),
-                "solvability": torch.tensor(s_sel, dtype=torch.long, device=self.device),
-            }
-        else:
-            return {
-                "paths_emb": paths_emb,
-                "attn_mask": attn_mask,
-                "node_ids": node_ids,
-                "file": file_path,
-                "gate_types": self.mem_gate_types[idx].to(self.device)
-                if hasattr(self, "mem_gate_types")
-                else torch.full_like(node_ids, -1),
-            }
+            paths_emb[p_sel, l_sel, D - 3 : D] = onehot
+
+        # Step 4: Inject random solver-derived constraints if enabled
+        c_mask_tensor = torch.zeros_like(node_ids, dtype=torch.bool, device=self.device)
+        c_vals_tensor = torch.zeros_like(node_ids, dtype=torch.long, device=self.device)
+        if self.inject_constraints and self.add_logic_value and final_info:
+            constraints = self._gen_constraints_for_sample(final_info, file_path)
+            if constraints:
+                for nid, val in constraints.items():
+                    mask = node_ids == nid
+                    if mask.any():
+                        c_mask_tensor |= mask
+                        c_vals_tensor[mask] = int(val)
+                        D = paths_emb.shape[-1]
+                        vec = torch.tensor(
+                            [1.0, 0.0, 0.0] if val == 0 else [0.0, 1.0, 0.0], device=self.device
+                        )
+                        paths_emb.view(-1, D)[mask.view(-1), D - 3 : D] = vec
+
+        # Step 5: Finalize dictionary
+        res = {
+            "paths_emb": paths_emb,
+            "attn_mask": attn_mask,
+            "node_ids": node_ids,
+            "gate_types": gate_types,
+            "file": file_path,
+            "anchor_p": torch.tensor(p_sel, dtype=torch.long, device=self.device),
+            "anchor_l": torch.tensor(l_sel, dtype=torch.long, device=self.device),
+            "anchor_v": torch.tensor(v_sel, dtype=torch.long, device=self.device),
+            "solvability": torch.tensor(s_sel, dtype=torch.long, device=self.device),
+        }
+        if self.inject_constraints:
+            # 25% skip for curriculum/speed
+            import random
+
+            if random.random() > 0.25:
+                res["constraint_mask"] = c_mask_tensor
+                res["constraint_vals"] = c_vals_tensor
+            else:
+                # Provide empty tensors but same shape
+                res["constraint_mask"] = torch.zeros_like(node_ids, dtype=torch.bool)
+                res["constraint_vals"] = torch.zeros_like(node_ids, dtype=torch.long)
+        return res
+
+    def _solve_sample_assignment(
+        self, info: Dict[str, Any], file_path: str
+    ) -> Optional[Dict[int, int]]:
+        """Fast solver that uses random PI simulation to get a consistent assignment."""
+        from src.atpg.logic_sim_three import logic_sim, reset_gates
+        from src.util.struct import GateType, LogicValue
+
+        try:
+            circuit = self._load_circuit_cached(file_path)
+            if not circuit:
+                return None
+        except Exception:
+            return None
+
+        import random
+
+        # Reset and assign random PIs
+        total_gates = len(circuit) - 1
+        reset_gates(circuit, total_gates)
+
+        for g in circuit:
+            if g and g.type == GateType.INPT:
+                g.val = random.choice([LogicValue.ZERO, LogicValue.ONE])
+
+        # Forward simulate
+        logic_sim(circuit, total_gates)
+
+        # Build assignment
+        return {i: int(circuit[i].val) for i in range(1, total_gates + 1)}
+
+    def _gen_constraints_for_sample(self, info: Dict[str, Any], file_path: str) -> Dict[int, int]:
+        """Generate random partial constraints consistent with a valid assignment."""
+        assignment = self._solve_sample_assignment(info, file_path)
+        if not assignment:
+            return {}
+
+        import random
+
+        constraints = {}
+        pair_info = info.get("pair_info", {})
+        reconv_node = pair_info.get("reconv")
+
+        # Filter assignment to only include nodes relevant to the paths (or PIs)
+        # Ideally, we constrain inputs or internal nodes on the paths
+        # path_nodes = set()
+        # for p in pair_info.get("paths", []):
+        #     path_nodes.update(p)
+
+        for nid, val in assignment.items():
+            # Don't constrain the target reconvergence node itself (that's the goal!)
+            if nid == reconv_node:
+                continue
+
+            # Randomly select subset based on probability
+            if random.random() < self.constraint_prob:
+                constraints[nid] = int(val)
+
+        return constraints
 
     def _gen_anchor_for_sample(
         self,
@@ -470,38 +487,30 @@ class ReconvergentPathsDataset(Dataset):
         - value: Logic value (0 or 1) at anchor point (-1 if no anchor)
         - solvability: 1 if structure is SAT, 0 if UNSAT or unknown
         """
-        from src.atpg.reconv_podem import PathConsistencySolver
         from src.util.struct import LogicValue
 
-        # Extract pair_info from info dict
-        if "pair_info" not in info:
+        if "pair_info" in info:
+            pair_info = info["pair_info"]
+        elif all(k in info for k in ["start", "reconv", "paths"]):
+            pair_info = info
+        else:
             return -1, -1, -1, 0
 
-        pair_info = info["pair_info"]
-        if not all(k in pair_info for k in ["start", "reconv", "paths"]):
-            return -1, -1, -1, 0
-
-        # Load circuit
-        try:
-            circuit = self._load_circuit_cached(file_path)
-        except Exception:
-            return -1, -1, -1, 0
-
-        # Initialize solver
-        solver = PathConsistencySolver(circuit)
-
-        # Try to solve for reconvergence = 1 first, then 0
-        assignment = None
-
-        for val in [LogicValue.ONE, LogicValue.ZERO]:
-            try:
-                assignment = solver.solve(pair_info, val, timeout=5.0)
-                if assignment:
-                    break
-            except Exception:
-                continue
+        # Try to solve for valid assignment using helper
+        assignment = self._solve_sample_assignment(info, file_path)
 
         # If no solution found, mark as UNSAT
+        if assignment is None:
+            # Try using the helper (which also tries 1 then 0)
+            assignment_dict = self._solve_sample_assignment(info, file_path)
+            if not assignment_dict:
+                return -1, -1, -1, 0
+            # Convert dict back to LogicValue for compatibility if needed,
+            # but helper returns int/LogicValue mixed?
+            # Helper returns whatever solver returns (LogicValue enum usually).
+            assignment = assignment_dict
+
+        # If no solution found (should be caught above), mark as UNSAT
         if assignment is None:
             return -1, -1, -1, 0
 
@@ -827,6 +836,10 @@ def reconv_collate(batch: List[Dict[str, Any]], max_paths: int = 0) -> Dict[str,
         if "gate_types" in item:
             gate_types[b, :p_curr, :l_i] = item["gate_types"][:p_curr]
         files.append(item["file"])
+
+    # Convert to float32 for model computation
+    # (keeps dataset/cache in float16 to save RAM)
+    paths = paths.to(torch.float32)
 
     out: Dict[str, Any] = {
         "paths_emb": paths,

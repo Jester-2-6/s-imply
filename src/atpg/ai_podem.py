@@ -48,7 +48,22 @@ class AIBacktracer:
         if self.verbose:
             print(f"[AI-BT] Objective: Gate {objective.gate_id} = {objective.value}")
         try:
-            # Build constraints from currently assigned PIs (using precomputed indices)
+            # Fast path: skip AI if no reconvergent structure exists
+            if hasattr(self.solver, "pair_cache"):
+                if objective.gate_id not in self.solver.pair_cache:
+                    pairs = self.solver._collect_and_sort_pairs(objective.gate_id)
+                    self.solver.pair_cache[objective.gate_id] = pairs
+                else:
+                    pairs = self.solver.pair_cache[objective.gate_id]
+
+                if not pairs:
+                    if self.verbose:
+                        print(
+                            f"  [AI-BT] No reconv pairs for gate {objective.gate_id}, skipping AI."
+                        )
+                    return simple_backtrace(objective, circuit)
+
+            # Build constraints from currently assigned PIs
             current_constraints = {}
             for i in self.pi_indices:
                 g = self.circuit[i]
@@ -179,21 +194,11 @@ class ModelPairPredictor(ReconvPairPredictor):
 
         # Load embeddings (SLOW step: ideally cached)
         self.extractor = EmbeddingExtractor()
-        # We need structural embeddings for the whole circuit to map them to pair
-        # paths.
-        # Note: EmbeddingExtractor returns embeddings for AIG nodes.
-        # We need a mapping from original gate IDs (used in pair_info) to
-        # AIG/embedding indices.
-        try:
-            self.struct_emb, _, self.gate_mapping, _ = self.extractor.extract_embeddings(
-                circuit_path
-            )
-            self.struct_emb = self.struct_emb.to(self.device)
-            # Map str(id) -> int(aig_id)
-            self.gate_mapping = {int(k): int(v) for k, v in self.gate_mapping.items()}
-        except Exception as e:
-            print(f"[AI-PODEM] Failed to extract embeddings: {e}")
-            self.struct_emb = None
+        # DeepGate is strictly required — no dummy fallback.
+        self.struct_emb, _, self.gate_mapping, _ = self.extractor.extract_embeddings(circuit_path)
+        self.struct_emb = self.struct_emb.to(self.device)
+        # Map str(id) -> int(aig_id)
+        self.gate_mapping = {int(k): int(v) for k, v in self.gate_mapping.items()}
 
         # Load Model
         self.model = self._load_model(config.model_path)

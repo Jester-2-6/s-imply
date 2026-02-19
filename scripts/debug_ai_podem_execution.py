@@ -83,13 +83,11 @@ def main():
                 stem = p.get("start", p.get("stem"))
                 reconv = p["reconv"]
                 p_len = len(p["paths"][0]) + len(p["paths"][1])
-                print(f"  {i+1}. Stem {stem} -> Reconv {reconv} " f"(Total Path Len: {p_len})")
+                print(f"  {i + 1}. Stem {stem} -> Reconv {reconv} (Total Path Len: {p_len})")
             if len(pairs) > 10:
-                print(f"  ... +{len(pairs)-10} more")
+                print(f"  ... +{len(pairs) - 10} more")
         else:
-            print(
-                "[Solver] ℹ No reconvergence found. " "Solver will only enforce target requirement."
-            )
+            print("[Solver] ℹ No reconvergence found. Solver will only enforce target requirement.")
         return pairs
 
     solver_module.HierarchicalReconvSolver._collect_and_sort_pairs = traced_collect_pairs
@@ -109,15 +107,14 @@ def main():
 
             seed_info = f" [Seed: {seed}]" if seed is not None else ""
             print(
-                f"\n{indent}┌────── [Step {pair_idx+1}/{len(pairs)}] "
+                f"\n{indent}┌────── [Step {pair_idx + 1}/{len(pairs)}] "
                 f"Solving Pair: Stem {stem} -> Reconv {reconv}{seed_info}"
             )
-            print(f"{indent}│   [State] Active Constraints: " f"{len(current_constraints)} nodes")
+            print(f"{indent}│   [State] Active Constraints: {len(current_constraints)} nodes")
             recursion_depth[0] += 1
         else:
             print(
-                f"\n{indent}┌────── [Base Case] All pairs processed. "
-                f"Checking final consistency..."
+                f"\n{indent}┌────── [Base Case] All pairs processed. Checking final consistency..."
             )
 
         # Call original
@@ -127,9 +124,9 @@ def main():
             recursion_depth[0] -= 1
             indent = "  " * recursion_depth[0]
             if result:
-                print(f"{indent}└────── ✓ SOLVED Step {pair_idx+1}")
+                print(f"{indent}└────── ✓ SOLVED Step {pair_idx + 1}")
             else:
-                print(f"{indent}└────── ✗ FAILED Step {pair_idx+1} (Backtracking)")
+                print(f"{indent}└────── ✗ FAILED Step {pair_idx + 1} (Backtracking)")
         else:
             if result:
                 print(f"{indent}└────── ✓ Solution Validated")
@@ -149,7 +146,7 @@ def main():
         depth = recursion_depth[0]
         indent = "  " * depth
 
-        print(f"{indent}│   [Inference] Querying AI Model for " f"Stem {stem} -> Reconv {reconv}")
+        print(f"{indent}│   [Inference] Querying AI Model for Stem {stem} -> Reconv {reconv}")
 
         # Call original predict
         predict_res = original_predict(pair_info, constraints, seed)
@@ -163,7 +160,7 @@ def main():
         if candidates:
             n_cands = len(candidates)
             tag = "" if n_cands == 1 else f" (+{n_cands - 1} fallback)"
-            print(f"{indent}│   [Inference] Model returned " f"{n_cands} candidate(s){tag}.")
+            print(f"{indent}│   [Inference] Model returned {n_cands} candidate(s){tag}.")
 
             # Show the model prediction (first candidate), path by path
             sample = candidates[0]
@@ -176,9 +173,9 @@ def main():
                         path_vals.append(f"{nid}:?")
                     else:
                         path_vals.append(f"{nid}:{int(val)}")
-                print(f"{indent}│   [Inference] Path {p_idx}: " f"[{' -> '.join(path_vals)}]")
+                print(f"{indent}│   [Inference] Path {p_idx}: [{' -> '.join(path_vals)}]")
         else:
-            print(f"{indent}│   [Inference] ⚠ Model returned " f"NO candidates (logical conflict).")
+            print(f"{indent}│   [Inference] ⚠ Model returned NO candidates (logical conflict).")
 
         return predict_res
 
@@ -224,27 +221,15 @@ def main():
             )
         else:
             print(
-                f"    [PODEM] Decision: Obj(Gate {objective.gate_id}="
-                f"{objective.value}) -> ✗ FAILED"
+                f"    [PODEM] Decision: Obj(Gate {objective.gate_id}={objective.value}) -> ✗ FAILED"
             )
         return res
 
     podem_module.simple_backtrace = traced_simple_backtrace
 
-    original_podem_recursion = podem_module.podem_recursion
-    podem_stats = {"calls": 0, "backtracks": 0}
-
-    def traced_podem_recursion(circuit, total_gates, fault):
-        podem_stats["calls"] += 1
-        res = original_podem_recursion(circuit, total_gates, fault)
-        if res == 0:  # UNTESTABLE / Backtrack
-            podem_stats["backtracks"] += 1
-            # Only print every 10th backtrack if there are many
-            if podem_stats["backtracks"] % 10 == 0:
-                print(f"    [PODEM] Info: Backtrack count = {podem_stats['backtracks']}")
-        return res
-
-    podem_module.podem_recursion = traced_podem_recursion
+    # Non-invasive PODEM monitoring: do NOT replace podem_recursion
+    # or set_trace_decisions — both interfere with recursion/output.
+    # Instead, we poll get_statistics() after the run.
 
     # Trace Logic Sim to see if it's the crash site
     import src.atpg.logic_sim_three as logic_sim_module
@@ -261,18 +246,16 @@ def main():
     original_solve_main = solver_module.HierarchicalReconvSolver.solve
 
     def traced_solve_with_verification(self, target_node, target_val, constraints=None, seed=None):
-        print(f"\n[Solver] === AI Justification Started: " f"Gate {target_node} = {target_val} ===")
+        print(f"\n[Solver] === AI Justification Started: Gate {target_node} = {target_val} ===")
         if constraints:
             print(f"[Solver] Current Constraints: {list(constraints.keys())}")
 
         result = original_solve_main(self, target_node, target_val, constraints, seed)
 
         if result:
-            print(f"\n    {'─'*40}")
+            print(f"\n    {'─' * 40}")
             print("    LOGIC CONSISTENCY VERIFICATION")
-            print(f"    {'─'*40}")
-
-            from src.atpg.logic_sim_three import compute_gate_value
+            print(f"    {'─' * 40}")
 
             inconsistencies = []
             for gid, expected_val in result.items():
@@ -286,25 +269,42 @@ def main():
                 if not all(fin in result for fin in gate.fin):
                     continue
 
-                # Temporarily set for computation
-                saved_vals = {fin: circuit[fin].val for fin in gate.fin}
-                for fin in gate.fin:
-                    circuit[fin].val = result[fin]
-                computed_val = compute_gate_value(circuit, gate)
-                for fin, val in saved_vals.items():
-                    circuit[fin].val = val
+                # Read-only verification: use result dict values directly
+                # DO NOT mutate circuit[fin].val — that corrupts PODEM state.
+                from src.util.struct import GateType as GT
 
-                if computed_val != expected_val:
+                fin_vals = [int(result[fin]) for fin in gate.fin]
+                gt = gate.type
+                if gt == GT.AND:
+                    computed_val = int(all(v == 1 for v in fin_vals))
+                elif gt == GT.NAND:
+                    computed_val = int(not all(v == 1 for v in fin_vals))
+                elif gt == GT.OR:
+                    computed_val = int(any(v == 1 for v in fin_vals))
+                elif gt == GT.NOR:
+                    computed_val = int(not any(v == 1 for v in fin_vals))
+                elif gt == GT.NOT:
+                    computed_val = 1 - fin_vals[0]
+                elif gt == GT.BUFF:
+                    computed_val = fin_vals[0]
+                elif gt == GT.XOR:
+                    computed_val = fin_vals[0] ^ fin_vals[1] if len(fin_vals) == 2 else 0
+                elif gt == GT.XNOR:
+                    computed_val = 1 - (fin_vals[0] ^ fin_vals[1]) if len(fin_vals) == 2 else 0
+                else:
+                    continue  # Unknown gate type
+
+                if computed_val != int(expected_val):
                     inconsistencies.append({"gate": gid, "exp": expected_val, "got": computed_val})
 
             if inconsistencies:
                 print(f"    ✗ FAILED: {len(inconsistencies)} inconsistencies found.")
                 for inc in inconsistencies[:3]:
-                    print(f"      Gate {inc['gate']}: Model={inc['exp']}, " f"Logic={inc['got']}")
+                    print(f"      Gate {inc['gate']}: Model={inc['exp']}, Logic={inc['got']}")
             else:
-                print(f"    ✓ SUCCESS: All {len(result)} assignments are " f"logically consistent.")
+                print(f"    ✓ SUCCESS: All {len(result)} assignments are logically consistent.")
 
-            print(f"    {'─'*40}\n")
+            print(f"    {'─' * 40}\n")
         else:
             print("\n[Solver] === AI Justification FAILED ===\n")
 
@@ -344,6 +344,10 @@ def main():
             print("\n" + "=" * 80)
             print("FINAL RESULT: FAILURE - No pattern found")
             print("=" * 80)
+
+        # Print PODEM statistics summary
+        stats = podem_module.get_statistics()
+        print(f"\n    PODEM Stats: {stats}")
 
     except Exception as e:
         print(f"\nCRITICAL ERROR: {e}")

@@ -91,8 +91,8 @@ class TrainConfig:
 
     # Phase 6: Constrained Training
     constrained_curriculum: bool = False
+    inject_constraints: bool = False
     max_constraint_prob: float = 0.5
-    enforce_constraints: bool = True
     enforce_constraints: bool = True
     processed_dir: Optional[str] = None
 
@@ -107,10 +107,9 @@ class TrainConfig:
     # Memory optimization
     grad_accum: int = 1
     checkpointing: bool = False
-    grad_accum: int = 1
-    checkpointing: bool = False
-    shard_cache_size: int = 10
+    shard_cache_size: int = 1
     max_paths: int = 200
+    pretrained: Optional[str] = None
 
 
 def make_dataloaders(cfg: TrainConfig, device: torch.device) -> Tuple[DataLoader, DataLoader]:
@@ -149,6 +148,8 @@ def make_dataloaders(cfg: TrainConfig, device: torch.device) -> Tuple[DataLoader
         anchor_in_dataset=cfg.dataset_anchor_hint,
         max_len_filter=cfg.max_len,
         cache_size=cfg.shard_cache_size,
+        inject_constraints=cfg.inject_constraints,
+        constraint_prob=cfg.max_constraint_prob if cfg.inject_constraints else 0.0,
     )
     print(f"Dataset ready. Splitting {len(dataset)} samples...", flush=True)
     # Minimal split: 90/10 train/val
@@ -157,6 +158,24 @@ def make_dataloaders(cfg: TrainConfig, device: torch.device) -> Tuple[DataLoader
     n_val = max(1, n - n_train)
     train_set, val_set = torch.utils.data.random_split(dataset, [n_train, n_val])
     print(f"Split done: {n_train} train, {n_val} val.", flush=True)
+
+    # TUNING: For large batch sizes, we MUST reduce prefetch_factor to save RAM
+    # With batch=1024 and factor=2, 8 workers buffer 16k samples (~20GB RAM!)
+    prefetch = 2
+    if cfg.batch_size >= 512:
+        prefetch = 1
+        print(
+            f"[RECONV-MEM] Large batch size ({cfg.batch_size}). "
+            f"Reducing prefetch_factor to {prefetch} to save RAM."
+        )
+
+    # CAPPING: Shard cache size per worker
+    if cfg.num_workers >= 4 and cfg.shard_cache_size > 2:
+        print(
+            f"[RECONV-MEM] High worker count ({cfg.num_workers}). "
+            "Capping shard_cache_size to 2 per worker."
+        )
+        cfg.shard_cache_size = 2
 
     # Use workers and pinned memory for faster host->device transfer when on CUDA
     if device.type == "cuda":
@@ -171,7 +190,7 @@ def make_dataloaders(cfg: TrainConfig, device: torch.device) -> Tuple[DataLoader
             collate_fn=final_collate_fn,
             num_workers=cfg.num_workers,
             pin_memory=cfg.pin_memory,
-            prefetch_factor=2 if cfg.num_workers > 0 else None,
+            prefetch_factor=prefetch if cfg.num_workers > 0 else None,
             persistent_workers=cfg.num_workers > 0,
         )
         val_loader = DataLoader(
@@ -181,7 +200,7 @@ def make_dataloaders(cfg: TrainConfig, device: torch.device) -> Tuple[DataLoader
             collate_fn=final_collate_fn,
             num_workers=cfg.num_workers,
             pin_memory=cfg.pin_memory,
-            prefetch_factor=2 if cfg.num_workers > 0 else None,
+            prefetch_factor=prefetch if cfg.num_workers > 0 else None,
             persistent_workers=cfg.num_workers > 0,
         )
         print("DataLoaders initialized.", flush=True)
@@ -265,14 +284,12 @@ def train_one_epoch(
 
     if cfg.verbose:
         print(f"Starting epoch {epoch} loop (waiting for DataLoader)...", flush=True)
-    pbar = tqdm(loader, desc=f"Epoch {epoch}", total=target_batches, disable=not cfg.verbose)
+    pbar = tqdm(loader, desc=f"Epoch {epoch}", total=target_batches, unit="batch")
 
-    # Calculate actual grad accumulation
-    accum_steps = cfg.grad_accum
-
-    print(f"[Memory] Batch={cfg.batch_size}, Accumulation Steps={accum_steps}")
+    print(f"[Memory] Batch={cfg.batch_size}")
 
     for batch_idx, batch in enumerate(pbar):
+        pbar.set_description(f"Epoch {epoch}")
         paths = batch["paths_emb"].to(device)
         masks = batch["attn_mask"].to(device)
         node_ids = batch["node_ids"].to(device)
@@ -280,36 +297,35 @@ def train_one_epoch(
         c_mask = batch["constraint_mask"].to(device) if "constraint_mask" in batch else None
         c_vals = batch["constraint_vals"].to(device) if "constraint_vals" in batch else None
 
-        # Initialize Logic Value Vector to "Unknown" [0, 0, 1] if enabled
-        if cfg.add_logic_value:
+        # 1. Initialize Logic Value Vector to "Unknown" [0, 0, 1] ONLY IF dataset didn't do it
+        # (inject_constraints=True in dataset already handles this)
+        if cfg.add_logic_value and not cfg.inject_constraints:
             B_cur, P_cur, L_cur, D_cur = paths.shape
             if D_cur >= 3:
-                # IMPORTANT: Perform this on CPU to avoid
-                # "CUDA error: no kernel image is available"
-                # which seems to happen on some GPU architectures with specific indexing
-                # patterns in DataParallel.
-                # This block is now applied after moving to device, assuming paths are on device.
-                # If this causes issues, it might need to be done in collate_fn or dataset.
+                # We initialize to [0, 0, 1] (Unknown)
                 paths[..., D_cur - 3] = 0.0
                 paths[..., D_cur - 2] = 0.0
                 paths[..., D_cur - 1] = 1.0
 
-        # Inject constraints into embeddings
+        # 2. Support manual constraint generation if dataset didn't provide them
+        if c_mask is None and not cfg.inject_constraints:
+            c_prob = cfg.max_constraint_prob if cfg.constrained_curriculum else 0.0
+            if c_prob > 0:
+                c_mask, c_vals = generate_constraints(node_ids, files, c_prob)
+                c_mask = c_mask.to(device)
+                c_vals = c_vals.to(device)
+
+        # 3. Inject constraints (either from batch or manually generated) into embeddings
         if cfg.add_logic_value and c_mask is not None:
-            # We always check for constraints but only inject if mask is present
             if c_mask.any():
                 D = paths.shape[-1]
                 if D >= 3:
-                    valid_mask = c_mask
-                    if valid_mask.any():
-                        targets = c_vals[valid_mask]
-                        one_hot = torch.zeros(
-                            (targets.shape[0], 3), device=device, dtype=paths.dtype
-                        )
-                        one_hot.scatter_(1, targets.unsqueeze(1), 1.0)
-                        paths_flat = paths.view(-1, D)
-                        mask_flat = valid_mask.view(-1)
-                        paths_flat[mask_flat, D - 3 : D] = one_hot
+                    targets = c_vals[c_mask]
+                    one_hot = torch.zeros((targets.shape[0], 3), device=device, dtype=paths.dtype)
+                    one_hot.scatter_(1, targets.unsqueeze(1), 1.0)
+                    paths_flat = paths.view(-1, D)
+                    mask_flat = c_mask.view(-1)
+                    paths_flat[mask_flat, D - 3 : D] = one_hot
 
         # Anchor hint generation if needed
         if cfg.anchor_hint and "anchor_p" not in batch:
@@ -370,17 +386,13 @@ def train_one_epoch(
                 anchor_alpha=cfg.anchor_reward_alpha,
                 gumbel_temp=gumbel_t,
             )
-            # Scale loss for accumulation
-            loss = loss / accum_steps
 
         scaler.scale(loss).backward()
+        scaler.step(optim)
+        scaler.update()
+        optim.zero_grad(set_to_none=True)
 
-        if (batch_idx + 1) % accum_steps == 0:
-            scaler.step(optim)
-            scaler.update()
-            optim.zero_grad(set_to_none=True)
-
-        total_loss += float(loss.item()) * accum_steps
+        total_loss += float(loss.item())
         total_reward += float(avg_reward)
         total_valid += float(valid_rate)
         total_edge_acc += float(batch_edge_acc)
@@ -388,11 +400,19 @@ def train_one_epoch(
         total_batches += 1
         bdone += paths.size(0)
 
-        if (
-            cfg.verbose
-            and cfg.log_interval > 0
-            and (batch_idx + 1) % (cfg.log_interval // accum_steps + 1) == 0
-        ):
+        # 4. RAM AWARENESS in main loop
+        if (batch_idx + 1) % 50 == 0:
+            import gc
+
+            import psutil
+
+            mem = psutil.virtual_memory()
+            if mem.percent > 90.0:
+                print(f"[RECONV-MEM] Main loop detected high RAM ({mem.percent}%). Cleaning up.")
+                gc.collect()
+                torch.cuda.empty_cache()
+
+        if cfg.verbose and cfg.log_interval > 0 and (batch_idx + 1) % cfg.log_interval == 0:
             dbg = _debug_metrics_from_logits(
                 logits,
                 node_ids,
@@ -452,7 +472,7 @@ def evaluate(
             else min(cfg.max_val_batches, target_batches)
         )
 
-    pbar = tqdm(loader, desc="Eval", total=target_batches, disable=not cfg.verbose)
+    pbar = tqdm(loader, desc="Eval", total=target_batches, unit="batch")
     for batch_idx, batch in enumerate(pbar):
         paths = batch["paths_emb"]
         masks = batch["attn_mask"]
@@ -464,21 +484,35 @@ def evaluate(
             masks = masks.to(device, non_blocking=True)
             node_ids = node_ids.to(device, non_blocking=True)
 
-        c_prob = cfg.max_constraint_prob if cfg.constrained_curriculum else 0.0
-        c_mask, c_vals = generate_constraints(node_ids, files, c_prob)
-        c_mask = c_mask.to(device)
-        c_vals = c_vals.to(device)
+        c_mask = batch["constraint_mask"].to(device) if "constraint_mask" in batch else None
+        c_vals = batch["constraint_vals"].to(device) if "constraint_vals" in batch else None
 
-        if cfg.add_logic_value and c_mask.any():
-            D = paths.shape[-1]
-            if D >= 3:
-                valid_mask = c_mask
-                if valid_mask.any():
-                    targets = c_vals[valid_mask]
+        # 1. Initialize Logic Value Vector to "Unknown" [0, 0, 1] ONLY IF dataset didn't do it
+        if cfg.add_logic_value and not cfg.inject_constraints:
+            D_cur = paths.shape[-1]
+            if D_cur >= 3:
+                paths[..., D_cur - 3] = 0.0
+                paths[..., D_cur - 2] = 0.0
+                paths[..., D_cur - 1] = 1.0
+
+        # 2. Support manual constraint generation if dataset didn't provide them
+        if c_mask is None and not cfg.inject_constraints:
+            c_prob = cfg.max_constraint_prob if cfg.constrained_curriculum else 0.0
+            if c_prob > 0:
+                c_mask, c_vals = generate_constraints(node_ids, files, c_prob)
+                c_mask = c_mask.to(device)
+                c_vals = c_vals.to(device)
+
+        # 3. Inject constraints into embeddings
+        if cfg.add_logic_value and c_mask is not None:
+            if c_mask.any():
+                D = paths.shape[-1]
+                if D >= 3:
+                    targets = c_vals[c_mask]
                     one_hot = torch.zeros((targets.shape[0], 3), device=device, dtype=paths.dtype)
                     one_hot.scatter_(1, targets.unsqueeze(1), 1.0)
                     paths_flat = paths.view(-1, D)
-                    mask_flat = valid_mask.view(-1)
+                    mask_flat = c_mask.view(-1)
                     paths_flat[mask_flat, D - 3 : D] = one_hot
 
         if cfg.anchor_hint:
@@ -579,7 +613,7 @@ def save_checkpoint(path: str, model: nn.Module, cfg: TrainConfig, best: bool = 
 
 
 def cmd_train(args: argparse.Namespace) -> None:
-    print(f"[DEBUG] Entering cmd_train with args: {args}", flush=True)
+    print(f"[DEBUG] Entering cmd_train with args: {args.cmd}", flush=True)
     cfg = TrainConfig(
         dataset=args.dataset,
         output=args.output,
@@ -615,7 +649,15 @@ def cmd_train(args: argparse.Namespace) -> None:
         checkpointing=getattr(args, "checkpointing", False),
         shard_cache_size=getattr(args, "shard_cache_size", 10),
         max_paths=getattr(args, "max_paths", 200),
+        inject_constraints=getattr(args, "inject_constraints", False),
+        pretrained=getattr(args, "pretrained", None),
     )
+
+    # Diagnostic logs for memory
+    eff_batch = cfg.batch_size * cfg.grad_accum
+    print(f"[RECONV-MEM] Batch Size (Physical): {cfg.batch_size}")
+    print(f"[RECONV-MEM] Grad Accumulation: {cfg.grad_accum}")
+    print(f"[RECONV-MEM] Effective Batch Size: {eff_batch}")
 
     # Handle checkpoint-dir alias
     if getattr(args, "checkpoint_dir", None):
@@ -681,6 +723,37 @@ def cmd_train(args: argparse.Namespace) -> None:
         print(f"Using {torch.cuda.device_count()} GPUs with DataParallel")
         model = nn.DataParallel(model)
 
+    # 4. LOAD WEIGHTS (Pretrained or Resume)
+    # Priority: 1. --pretrained flag  2. --output/best_model.pth (auto-resume)
+    weight_path = None
+    if cfg.pretrained:
+        if os.path.isfile(cfg.pretrained):
+            weight_path = cfg.pretrained
+        else:
+            weight_path = os.path.join(cfg.pretrained, "best_model.pth")
+    else:
+        auto_resume = os.path.join(cfg.output, "best_model.pth")
+        if os.path.exists(auto_resume):
+            weight_path = auto_resume
+
+    if weight_path and os.path.exists(weight_path):
+        print(f"Loading weights from {weight_path}...")
+        try:
+            state = torch.load(weight_path, map_location=device)
+            weights = state["model_state_dict"] if "model_state_dict" in state else state
+
+            has_module = any(k.startswith("module.") for k in weights.keys())
+            is_dp = isinstance(model, nn.DataParallel)
+            if is_dp and not has_module:
+                weights = {"module." + k: v for k, v in weights.items()}
+            elif not is_dp and has_module:
+                weights = {k.replace("module.", ""): v for k, v in weights.items()}
+
+            model.load_state_dict(weights, strict=False)
+            print("Weights loaded successfully.")
+        except Exception as e:
+            print(f"Warning: Failed to load weights: {e}")
+
     optim = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
     scaler = torch.amp.GradScaler("cuda", enabled=cfg.amp)
 
@@ -724,6 +797,14 @@ def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Minimal reconv transformer trainer")
     sub = p.add_subparsers(dest="cmd", required=True)
 
+    # SHARD command
+    s = sub.add_parser("shard", help="Convert pickle dataset to lazy-loadable shards")
+    s.add_argument("--dataset", type=str, required=True, help="Input .pkl dataset")
+    s.add_argument("--output-dir", type=str, required=True, help="Output directory for shards")
+    s.add_argument("--shard-size", type=int, default=5000, help="Samples per shard")
+    s.add_argument("--max-path-length", type=int, default=50, help="Max length to pad/truncate")
+
+    # TRAIN command
     t = sub.add_parser("train", help="Run supervised training")
     t.add_argument(
         "--dataset",
@@ -743,6 +824,11 @@ def build_argparser() -> argparse.ArgumentParser:
         help="Output checkpoint directory",
     )
     t.add_argument(
+        "--pretrained",
+        type=str,
+        help="Path to pretrained model file or directory (loads best_model.pth)",
+    )
+    t.add_argument(
         "--checkpoint-dir",
         type=str,
         help="Output checkpoint directory (alias for --output)",
@@ -758,7 +844,12 @@ def build_argparser() -> argparse.ArgumentParser:
     t.add_argument(
         "--constrained-curriculum",
         action="store_true",
-        help="Enable constrained path training curriculum",
+        help="Enable constrained path training curriculum (random constraints in loop)",
+    )
+    t.add_argument(
+        "--inject-constraints",
+        action="store_true",
+        help="Enable solver-consistent constraint injection at dataset level",
     )
     t.add_argument(
         "--max-constraint-prob",
@@ -920,6 +1011,14 @@ def main() -> None:
     if args.cmd == "train":
         print("[DEBUG] Orchestrating training command...", flush=True)
         cmd_train(args)
+    elif args.cmd == "shard":
+        print("[DEBUG] Orchestrating sharding command...", flush=True)
+        ReconvergentPathsDataset.preprocess_to_shards(
+            input_dataset_path=args.dataset,
+            output_dir=args.output_dir,
+            shard_size=args.shard_size,
+            max_path_length=args.max_path_length,
+        )
     else:
         raise SystemExit(f"Unknown command: {args.cmd}")
 
