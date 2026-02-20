@@ -151,3 +151,11 @@ Resolved critical pipeline failures and implemented SSD-optimized data loading:
 -   **Lazy Loading (`ReconvergentPathsDataset`)**: Implemented on-demand shard loading to handle massive datasets without exhausting RAM. The dataset now loads only metadata initially and fetches tensor data from disk-cached shards during iteration.
 -   **Pipeline Stabilization**: Fixed circular dependencies and missing helper functions (`_generate_anchor`, `resolve_gate_types`) that were causing `ImportError` failures in `src.ml.train`.
 -   **Performance**: Optimized `gate_mapping` conversion with integer-key pre-checks, reducing initialization time. Multi-worker data loading verified to work correctly with lazy loading logic.
+
+### E. Just-In-Time Architecture & AI Consistency Enforcement
+**Timestamp: 2026-02-20**
+Rewrote `HierarchicalReconvSolver` to replace upfront path resolution with a "Just-In-Time" backtrace algorithm driven by dynamic PI verification queues.
+-   **Dynamic Instantiation:** Predicts logic only when trace paths topologicaly intersect a path pair's reconvergent terminus, scaling effortlessly to wider arrays.
+-   **Context Merging:** Plumbed `ai_podem.py` constraints implicitly through to model tensor structures (`batch_embs[128:130]`) alongside deterministic fallback verifications over XOR/XNOR topologies.
+-   **Logic Tying:** Tested via benchmark validation on `c432.bench 329-0`. The backtracking model natively rejects hallucinated outputs yielding unresolvable constraints upstream, collapsing conflicting trees logically while accepting sound traces dynamically. 
+

@@ -199,6 +199,7 @@ class ModelPairPredictor(ReconvPairPredictor):
         self.struct_emb = self.struct_emb.to(self.device)
         # Map str(id) -> int(aig_id)
         self.gate_mapping = {int(k): int(v) for k, v in self.gate_mapping.items()}
+        self.prediction_cache = {}
 
         # Load Model
         self.model = self._load_model(config.model_path)
@@ -241,9 +242,22 @@ class ModelPairPredictor(ReconvPairPredictor):
         constraints: Dict[int, LogicValue],
         seed: Optional[int] = None,
     ) -> Tuple[List[Dict[int, LogicValue]], Optional[Dict[str, Any]]]:
+        path_nodes = set()
+        for p in pair_info["paths"]:
+            path_nodes.update(p)
+
+        relevant_constraints = frozenset(
+            (nid, val) for nid, val in constraints.items() if nid in path_nodes
+        )
+        cache_key = (pair_info["start"], pair_info["reconv"], relevant_constraints)
+        if cache_key in self.prediction_cache:
+            return self.prediction_cache[cache_key]
+
         if self.struct_emb is None or self.model is None:
             # Fallback to pure solver if model failed
-            return self._fallback_solve(pair_info, constraints)[0], None
+            res = self._fallback_solve(pair_info, constraints)[0], None
+            self.prediction_cache[cache_key] = res
+            return res
 
         # 1. Prepare Batch for Model
 
@@ -265,7 +279,9 @@ class ModelPairPredictor(ReconvPairPredictor):
         if all_constrained and precomputed_assignment:
             # All gates already have values - skip model, return existing values
             # Need strict type match for return tuple
-            return [precomputed_assignment], None
+            res = [precomputed_assignment], None
+            self.prediction_cache[cache_key] = res
+            return res
 
         # Convert path node IDs to AIG IDs to get embeddings
         path_embs_list = []
@@ -292,6 +308,14 @@ class ModelPairPredictor(ReconvPairPredictor):
                 if len(p_emb[-1]) < 132:
                     pad = torch.zeros(132 - len(p_emb[-1]), device=self.device)
                     p_emb[-1] = torch.cat([p_emb[-1], pad])
+
+                if nid in constraints:
+                    val = constraints[nid]
+                    p_emb[-1][128] = 1.0  # is_constrained
+                    if val == LogicValue.ZERO:
+                        p_emb[-1][129] = 1.0
+                    elif val == LogicValue.ONE:
+                        p_emb[-1][130] = 1.0
 
                 # Gate Type
                 if nid < len(self.circuit):
@@ -381,7 +405,7 @@ class ModelPairPredictor(ReconvPairPredictor):
                 predicted_assignment[nid] = lv
                 node_confidence[nid] = conf
 
-        return self._rank_solutions_with_model(
+        res = self._rank_solutions_with_model(
             pair_info,
             constraints,
             probs,
@@ -389,6 +413,8 @@ class ModelPairPredictor(ReconvPairPredictor):
             predicted_assignment,
             inputs_snapshot,
         )
+        self.prediction_cache[cache_key] = res
+        return res
 
     def _rank_solutions_with_model(
         self,
@@ -399,7 +425,7 @@ class ModelPairPredictor(ReconvPairPredictor):
         predicted_assignment,
         inputs_snapshot,
     ):
-        violations = self._verify_assignment_logic(predicted_assignment)
+        violations = self._verify_assignment_logic(predicted_assignment, constraints)
 
         # Always return model prediction as first candidate.
         # The HierarchicalReconvSolver._solve_recursive does its own
@@ -411,9 +437,11 @@ class ModelPairPredictor(ReconvPairPredictor):
             fallback, _ = self._fallback_solve(pair_info, constraints)
             candidates.extend(fallback)
 
-        return candidates, inputs_snapshot
+        return candidates[:10], inputs_snapshot
 
-    def _verify_assignment_logic(self, assignment: Dict[int, LogicValue]) -> int:
+    def _verify_assignment_logic(
+        self, assignment: Dict[int, LogicValue], constraints: Dict[int, LogicValue] = None
+    ) -> int:
         """Verify logical consistency and return the count of violations.
 
         Returns 0 if all gates are consistent, otherwise the number of
@@ -429,13 +457,18 @@ class ModelPairPredictor(ReconvPairPredictor):
             if not gate.fin:
                 continue
 
-            # Check if all inputs are present in the assignment
-            if all(fin in assignment for fin in gate.fin):
+            full_ctx = {}
+            if constraints:
+                full_ctx.update(constraints)
+            full_ctx.update(assignment)
+
+            # Check if all inputs are present in the full context
+            if all(fin in full_ctx for fin in gate.fin):
                 original_vals = {fin: self.circuit[fin].val for fin in gate.fin}
                 original_gate_val = gate.val
 
                 for fin in gate.fin:
-                    self.circuit[fin].val = assignment[fin]
+                    self.circuit[fin].val = full_ctx[fin]
 
                 expected_val = compute_gate_value(self.circuit, gate)
 
@@ -544,7 +577,10 @@ def ai_podem(
     # --- Step 1: AI Justification (Activation) ---
     if enable_ai_activation and solver:
         # Target: Fault Activation
-        activation_val = LogicValue.ONE if fault.value == LogicValue.D else LogicValue.ZERO
+        # Target: Fault Activation (If s-a-0 or D, we want 1. If s-a-1 or DB, we want 0)
+        activation_val = (
+            LogicValue.ONE if fault.value in [LogicValue.ZERO, LogicValue.D] else LogicValue.ZERO
+        )
         if verbose:
             print(
                 "[AI-PODEM] Attempting AI Justification for Fault "

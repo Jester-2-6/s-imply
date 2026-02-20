@@ -60,6 +60,10 @@ class HierarchicalReconvSolver:
         self.predictor = predictor
         self.recorder = recorder
         self.verbose = verbose
+        self.nodes_visited_limit = 1000
+        self.nodes_visited = 0
+        self.inference_limit = 1000
+        self.inferences = 0
         # Helper for consistency checks, reused from existing codebase
         self.consistency_checker = PathConsistencySolver(circuit)
 
@@ -86,21 +90,31 @@ class HierarchicalReconvSolver:
         # 1. & 2. Find relevant pairs (use cache to avoid redundant BFS)
         if target_node not in self.pair_cache:
             self.pair_cache[target_node] = self._collect_and_sort_pairs(target_node)
-        pairs = self.pair_cache[target_node]
+        pairs_by_reconv = self.pair_cache[target_node]
 
         if self.verbose:
-            print(f"[Solver] Found {len(pairs)} reconvergent pairs")
+            print("[Solver] Collected reconvergent pairs")
 
         # Initial constraints: target + provided constraints
         initial_constraints = {}
         if constraints:
-            initial_constraints.update(constraints)
+            initial_constraints.update(
+                {k: LogicValue(v) if isinstance(v, int) else v for k, v in constraints.items()}
+            )
 
         # Set/Overwrite target requirement
-        initial_constraints[target_node] = target_val
+        initial_constraints[target_node] = (
+            LogicValue(target_val) if isinstance(target_val, int) else target_val
+        )
 
         # 3. Recursive Solve
-        final_assignment = self._solve_recursive(0, pairs, initial_constraints, seed)
+        queue = [target_node]
+        solved_pairs = set()
+        self.nodes_visited = 0
+        self.inferences = 0
+        final_assignment = self._backward_justify(
+            queue, initial_constraints, solved_pairs, pairs_by_reconv, seed
+        )
 
         return final_assignment
 
@@ -132,7 +146,15 @@ class HierarchicalReconvSolver:
             return (total_path_len + dist_to_target, total_path_len)
 
         pairs.sort(key=pair_cost)
-        return pairs
+
+        pairs_by_reconv = {}
+        for p in pairs:
+            r = p["reconv"]
+            if r not in pairs_by_reconv:
+                pairs_by_reconv[r] = []
+            pairs_by_reconv[r].append(p)
+
+        return pairs_by_reconv
 
     def _get_transitive_fanin(self, root: int) -> Set[int]:
         """BFS backwards to find all nodes feeding root."""
@@ -228,93 +250,166 @@ class HierarchicalReconvSolver:
                         queue.append(fo)
         return results
 
-    def _solve_recursive(
+    def _backward_justify(
         self,
-        pair_idx: int,
-        pairs: List[Dict[str, Any]],
-        current_constraints: Dict[int, LogicValue],
+        queue: List[int],
+        assignment: Dict[int, LogicValue],
+        solved_pairs: Set[int],
+        pairs_by_reconv: Dict[int, List[Dict[str, Any]]],
         seed: Optional[int] = None,
     ) -> Optional[Dict[int, LogicValue]]:
-        """Backtracking solver with AI prediction support."""
-        if pair_idx >= len(pairs):
-            if self.verbose:
-                print("[Solver] Base case: justifying remaining requirements...")
-            return self._justify_all(current_constraints)
-
-        pair = pairs[pair_idx]
-        indent = "  " * (pair_idx + 1)
-        if self.verbose:
-            stem = pair.get("start", pair.get("stem"))
-            print(f"[Solver]{indent} Solving Pair {pair_idx}: Stem {stem} -> {pair['reconv']}")
-
-        step_seed = None
-        if seed is not None:
-            step_seed = (seed + pair_idx * 7919) % 2147483647
-
-        prediction_result = self.predictor.predict(pair, current_constraints, seed=step_seed)
-        inputs_snapshot = None
-        if isinstance(prediction_result, tuple):
-            candidates, inputs_snapshot = prediction_result
-        else:
-            candidates = prediction_result
-
-        if not candidates:
+        """Queue-based backward justification with just-in-time AI predictor."""
+        self.nodes_visited += 1
+        if self.nodes_visited >= self.nodes_visited_limit:
             return None
 
-        for i, assignment_part in enumerate(candidates):
-            step_record = None
-            if self.recorder and inputs_snapshot:
-                step_record = self.recorder.log_step(
-                    node_ids=inputs_snapshot["node_ids"],
-                    mask_valid=inputs_snapshot["mask_valid"],
-                    gate_types=inputs_snapshot["gate_types"],
-                    files=inputs_snapshot["files"],
-                    pair_info=pair,
-                    selected_assignment=assignment_part,
+        if not queue:
+            return assignment
+
+        # Sort queue: highest ID (furthest back) first
+        queue.sort(reverse=True)
+
+        gate = queue.pop(0)
+        val = assignment[gate]
+
+        # Check if already justified
+        gate_obj = self.circuit[gate]
+        if gate_obj.type != GateType.INPT:
+            input_vals = [assignment.get(fin, LogicValue.XD) for fin in gate_obj.fin]
+            if self._compute_gate_robust(gate_obj.type, input_vals) == val:
+                return self._backward_justify(
+                    list(queue), assignment, solved_pairs, pairs_by_reconv, seed
                 )
 
-            new_constraints = current_constraints.copy()
-            conflict = False
-            for k, v in assignment_part.items():
-                if not self._check_global_consistency(k, v, new_constraints):
-                    conflict = True
-                    break
-                new_constraints[k] = v
+        # Check if gate is a terminus for any UNsolved path pairs
+        unsolved_pairs = []
+        if gate in pairs_by_reconv:
+            unsolved_pairs = [p for p in pairs_by_reconv[gate] if id(p) not in solved_pairs]
 
-            if conflict:
-                if step_record and self.recorder:
-                    self.recorder.mark_backtrack(penalty=-0.5)
-                continue
+        if unsolved_pairs:
+            # Suspend normal backtrace, try AI model on all available unsolved pairs
+            for pair in unsolved_pairs:
+                if (
+                    self.nodes_visited >= self.nodes_visited_limit
+                    or self.inferences >= self.inference_limit
+                ):
+                    return None
+                self.inferences += 1
+                prediction_result = self.predictor.predict(pair, assignment, seed=seed)
+                inputs_snapshot = None
+                if isinstance(prediction_result, tuple):
+                    candidates, inputs_snapshot = prediction_result
+                else:
+                    candidates = prediction_result
 
-            result = self._solve_recursive(pair_idx + 1, pairs, new_constraints, seed)
+                if not candidates:
+                    continue
+
+                for i, assignment_part in enumerate(candidates):
+                    if self.nodes_visited >= self.nodes_visited_limit:
+                        return None
+                    step_record = None
+                    if self.recorder and inputs_snapshot:
+                        step_record = self.recorder.log_step(
+                            node_ids=inputs_snapshot["node_ids"],
+                            mask_valid=inputs_snapshot["mask_valid"],
+                            gate_types=inputs_snapshot["gate_types"],
+                            files=inputs_snapshot["files"],
+                            pair_info=pair,
+                            selected_assignment=assignment_part,
+                        )
+
+                    new_assignment = assignment.copy()
+                    conflict = False
+                    for k, v in assignment_part.items():
+                        if not self._check_global_consistency(k, v, new_assignment):
+                            conflict = True
+                            break
+                        new_assignment[k] = v
+
+                    if conflict:
+                        if step_record and self.recorder:
+                            self.recorder.mark_backtrack(penalty=-0.5)
+                        continue
+
+                    # Detailed Logic Consistency Check
+                    for k in assignment_part.keys():
+                        gate_obj = self.circuit[k]
+                        if gate_obj.type != GateType.INPT:
+                            input_vals = [
+                                new_assignment.get(fin, LogicValue.XD) for fin in gate_obj.fin
+                            ]
+                            comp_val = self._compute_gate_robust(gate_obj.type, input_vals)
+                            if comp_val != LogicValue.XD and comp_val != new_assignment[k]:
+                                conflict = True
+                                break
+                        for fout in gate_obj.fot:
+                            if fout in new_assignment:
+                                fout_obj = self.circuit[fout]
+                                input_vals = [
+                                    new_assignment.get(fin, LogicValue.XD) for fin in fout_obj.fin
+                                ]
+                                comp_val = self._compute_gate_robust(fout_obj.type, input_vals)
+                                if comp_val != LogicValue.XD and comp_val != new_assignment[fout]:
+                                    conflict = True
+                                    break
+                        if conflict:
+                            break
+
+                    if conflict:
+                        if step_record and self.recorder:
+                            self.recorder.mark_backtrack(penalty=-0.5)
+                        continue
+
+                    new_queue = list(queue)
+                    # Enqueue new requirements that are not PIs
+                    for k in assignment_part.keys():
+                        if k not in new_queue and self.circuit[k].type != GateType.INPT:
+                            new_queue.append(k)
+
+                    new_solved = set(solved_pairs)
+                    new_solved.add(id(pair))
+
+                    result = self._backward_justify(
+                        new_queue, new_assignment, new_solved, pairs_by_reconv, seed
+                    )
+                    if result is not None:
+                        return result
+
+                    if step_record and self.recorder:
+                        self.recorder.mark_backtrack(penalty=-0.5)
+
+            # If all pairs failed/contradicted, fail fast instead of hanging in standard DFS
+            return None
+
+        # Standard Gate Justification
+        gate_obj = self.circuit[gate]
+        if gate_obj.type == GateType.INPT:
+            return self._backward_justify(
+                list(queue), assignment, solved_pairs, pairs_by_reconv, seed
+            )
+
+        options = self._justify_gate(gate, val, assignment)
+        if not options:
+            return None
+
+        for reqs in options:
+            if self.nodes_visited >= self.nodes_visited_limit:
+                return None
+            new_assignment = assignment.copy()
+            new_queue = list(queue)
+            for r_node, r_val in reqs.items():
+                new_assignment[r_node] = r_val
+                if self.circuit[r_node].type != GateType.INPT and r_node not in new_queue:
+                    new_queue.append(r_node)
+
+            result = self._backward_justify(
+                new_queue, new_assignment, solved_pairs, pairs_by_reconv, seed
+            )
             if result is not None:
                 return result
 
-            if step_record and self.recorder:
-                self.recorder.mark_backtrack(penalty=-0.5)
-
         return None
-
-    def _justify_all(self, assignment: Dict[int, LogicValue]) -> Optional[Dict[int, LogicValue]]:
-        """Justify all current assignments back to primary inputs."""
-        full_assignment = assignment.copy()
-        queue = [n for n in full_assignment if self.circuit[n].type != GateType.INPT]
-
-        while queue:
-            node = queue.pop(0)
-            val = full_assignment[node]
-            reqs = self._justify_gate(node, val, full_assignment)
-            if reqs is None:
-                return None
-
-            for fin, fval in reqs.items():
-                if fin not in full_assignment:
-                    full_assignment[fin] = fval
-                    if self.circuit[fin].type != GateType.INPT:
-                        queue.append(fin)
-                elif full_assignment[fin] != fval:
-                    return None
-        return full_assignment
 
     def _check_global_consistency(
         self, node: int, val: LogicValue, assignment: Dict[int, LogicValue]
@@ -343,77 +438,108 @@ class HierarchicalReconvSolver:
 
     def _justify_gate(
         self, node: int, val: LogicValue, assignment: Dict[int, LogicValue]
-    ) -> Optional[Dict[int, LogicValue]]:
+    ) -> List[Dict[int, LogicValue]]:
+        """Return all valid justification options for a gate."""
         gate = self.circuit[node]
         unassigned = [fin for fin in gate.fin if fin not in assignment]
         if not unassigned:
             input_vals = [assignment[fin] for fin in gate.fin]
             res = self._compute_simple(gate.type, input_vals)
-            return {} if res == val else None
+            return [{}] if res == val else []
 
         input_vals_partial = [assignment.get(fin, LogicValue.XD) for fin in gate.fin]
         computed = self._compute_gate_robust(gate.type, input_vals_partial)
         if computed != LogicValue.XD and computed != val:
-            return None
+            return []
         if computed == val:
-            return {}
+            return [{}]
 
-        reqs = {}
+        options = []
         if gate.type == GateType.AND:
             if val == LogicValue.ONE:
+                reqs = {}
                 for fin in unassigned:
                     reqs[fin] = LogicValue.ONE
+                options.append(reqs)
             else:
                 for fin in unassigned:
                     if self._check_global_consistency(fin, LogicValue.ZERO, assignment):
-                        reqs[fin] = LogicValue.ZERO
-                        break
-                else:
-                    return None
+                        options.append({fin: LogicValue.ZERO})
         elif gate.type == GateType.NAND:
             if val == LogicValue.ZERO:
+                reqs = {}
                 for fin in unassigned:
                     reqs[fin] = LogicValue.ONE
+                options.append(reqs)
             else:
                 for fin in unassigned:
                     if self._check_global_consistency(fin, LogicValue.ZERO, assignment):
-                        reqs[fin] = LogicValue.ZERO
-                        break
-                else:
-                    return None
+                        options.append({fin: LogicValue.ZERO})
         elif gate.type == GateType.OR:
             if val == LogicValue.ZERO:
+                reqs = {}
                 for fin in unassigned:
                     reqs[fin] = LogicValue.ZERO
+                options.append(reqs)
             else:
                 for fin in unassigned:
                     if self._check_global_consistency(fin, LogicValue.ONE, assignment):
-                        reqs[fin] = LogicValue.ONE
-                        break
-                else:
-                    return None
+                        options.append({fin: LogicValue.ONE})
         elif gate.type == GateType.NOR:
             if val == LogicValue.ONE:
+                reqs = {}
                 for fin in unassigned:
                     reqs[fin] = LogicValue.ZERO
+                options.append(reqs)
             else:
                 for fin in unassigned:
                     if self._check_global_consistency(fin, LogicValue.ONE, assignment):
-                        reqs[fin] = LogicValue.ONE
-                        break
-                else:
-                    return None
+                        options.append({fin: LogicValue.ONE})
         elif gate.type == GateType.NOT:
-            reqs[gate.fin[0]] = LogicValue.ZERO if val == LogicValue.ONE else LogicValue.ONE
+            options.append(
+                {gate.fin[0]: LogicValue.ZERO if val == LogicValue.ONE else LogicValue.ONE}
+            )
         elif gate.type == GateType.BUFF:
-            reqs[gate.fin[0]] = val
-        else:
-            return None
+            options.append({gate.fin[0]: val})
+        elif gate.type in (GateType.XOR, GateType.XNOR):
+            # Only support 2-input XOR/XNOR for simplicity
+            if len(gate.fin) == 2:
+                target_val = (
+                    val
+                    if gate.type == GateType.XOR
+                    else (LogicValue.ONE if val == LogicValue.ZERO else LogicValue.ZERO)
+                )
+                if len(unassigned) == 1:
+                    assigned_fin = [fin for fin in gate.fin if fin not in unassigned][0]
+                    assigned_val = assignment[assigned_fin]
+                    req_val = LogicValue.ONE if assigned_val != target_val else LogicValue.ZERO
+                    options.append({unassigned[0]: req_val})
+                elif len(unassigned) == 2:
+                    not_target = LogicValue.ZERO if target_val == LogicValue.ONE else LogicValue.ONE
+                    options.append({unassigned[0]: LogicValue.ZERO, unassigned[1]: target_val})
+                    options.append({unassigned[0]: LogicValue.ONE, unassigned[1]: not_target})
 
-        for r_node, r_val in reqs.items():
-            if not self._check_global_consistency(r_node, r_val, assignment):
-                return None
-        return reqs
+        # Filter out globally inconsistent options
+        valid_options = []
+        for reqs in options:
+            valid = True
+            for r_node, r_val in reqs.items():
+                if not self._check_global_consistency(r_node, r_val, assignment):
+                    valid = False
+                    break
+            if valid:
+                valid_options.append(reqs)
+
+        # Sort options: prioritize PIs or lower topological IDs
+        # To avoid deep backtracking without AI guidance
+        def _cost(opt: Dict[int, LogicValue]) -> int:
+            if not opt:
+                return 0
+            # We want to pick options that rely on smaller node IDs first (closer to PIs)
+            return max(opt.keys())
+
+        valid_options.sort(key=_cost)
+        return valid_options
 
     def _compute_simple(self, gtype: int, inputs: List[LogicValue]) -> LogicValue:
         if gtype == GateType.AND:
@@ -428,6 +554,12 @@ class HierarchicalReconvSolver:
             return LogicValue.ZERO if inputs[0] == LogicValue.ONE else LogicValue.ONE
         if gtype == GateType.BUFF:
             return inputs[0]
+        if gtype == GateType.XOR:
+            ones = sum(1 for i in inputs if i == LogicValue.ONE)
+            return LogicValue.ONE if ones % 2 == 1 else LogicValue.ZERO
+        if gtype == GateType.XNOR:
+            ones = sum(1 for i in inputs if i == LogicValue.ONE)
+            return LogicValue.ZERO if ones % 2 == 1 else LogicValue.ONE
         return LogicValue.XD
 
     def _compute_gate_robust(self, gtype: int, inputs: List[LogicValue]) -> LogicValue:
@@ -461,4 +593,14 @@ class HierarchicalReconvSolver:
             return LogicValue.ZERO if inputs[0] == LogicValue.ONE else LogicValue.ONE
         elif gtype == GateType.BUFF:
             return inputs[0]
+        elif gtype == GateType.XOR:
+            if any(i == LogicValue.XD for i in inputs):
+                return LogicValue.XD
+            ones = sum(1 for i in inputs if i == LogicValue.ONE)
+            return LogicValue.ONE if ones % 2 == 1 else LogicValue.ZERO
+        elif gtype == GateType.XNOR:
+            if any(i == LogicValue.XD for i in inputs):
+                return LogicValue.XD
+            ones = sum(1 for i in inputs if i == LogicValue.ONE)
+            return LogicValue.ZERO if ones % 2 == 1 else LogicValue.ONE
         return LogicValue.XD
