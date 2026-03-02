@@ -56,7 +56,7 @@ class HierarchicalReconvSolver:
         predictor: ReconvPairPredictor,
         recorder=None,
         verbose: bool = False,
-        circuit_path: str = None,
+        circuit_path: str | None = None,
     ):
         self.circuit = circuit
         self.predictor = predictor
@@ -99,7 +99,7 @@ class HierarchicalReconvSolver:
         self,
         target_node: int,
         target_val: LogicValue,
-        constraints: Dict[int, LogicValue] = None,
+        constraints: Dict[int, LogicValue] | None = None,
         seed: Optional[int] = None,
     ) -> Optional[Dict[int, LogicValue]]:
         """

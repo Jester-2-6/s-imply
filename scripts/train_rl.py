@@ -10,6 +10,7 @@ This script:
 """
 
 import argparse
+import functools
 import gc
 import glob
 import os
@@ -57,7 +58,7 @@ class EmbeddingRegistry:
     def __init__(self):
         self.cache = {}
 
-    def get_embedding(self, bench_file: str) -> torch.Tensor:
+    def get_embedding(self, bench_file: str) -> torch.Tensor | None:
         if not bench_file:
             return None
 
@@ -177,7 +178,8 @@ def collate_experience(batch, max_paths_limit=0, embedding_registry=None):
     rewards = torch.stack([b["reward"] for b in batch])
 
     # Optional embeddings tensor [B, P, L, 132]
-    # We pad to 132 for backwards compatibility with the current model which expects logic constraint dims
+    # We pad to 132 for backwards compatibility with the current model which expects
+    # logic constraint dims
     paths_emb = torch.zeros(batch_size, max_paths, max_len, 132, dtype=torch.float32)
 
     for i, b in enumerate(batch):
@@ -199,8 +201,9 @@ def collate_experience(batch, max_paths_limit=0, embedding_registry=None):
                     for p_idx in range(p_curr):
                         for l_idx in range(length):
                             nid = nids_clamped[p_idx, l_idx].item()
-                            # We assume the AI Podem gate mapping roughly tracks with AIG up to a point,
-                            # but realistically we just use the node ID directly since embedding extractor mapped it
+                            # We assume the AI Podem gate mapping roughly tracks with AIG
+                            # up to a point, but we just use the node ID directly since
+                            # the embedding extractor already mapped it.
                             if 0 < nid < vocab_size:
                                 paths_emb[i, p_idx, l_idx, :128] = circuit_emb[nid]
 
@@ -228,7 +231,7 @@ def collate_experience(batch, max_paths_limit=0, embedding_registry=None):
     }
 
 
-def train_epoch(model, dataloader, optimizer, config, device, epoch):
+def train_epoch(model, dataloader, optimizer, scaler, config, device, epoch):
     """Train for one epoch using policy gradient."""
 
     model.train()
@@ -237,21 +240,17 @@ def train_epoch(model, dataloader, optimizer, config, device, epoch):
     total_entropy = 0.0
 
     pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}")
-    scaler = torch.amp.GradScaler("cuda", enabled=config.amp)
 
     for batch in pbar:
-        node_ids = batch["node_ids"].to(device)
         mask_valid = batch["mask_valid"].to(device)
         gate_types = batch["gate_types"].to(device)
         rewards = batch["rewards"].to(device)
 
-        B, P, L = node_ids.shape
-
         # Use the dynamically reconstructed embeddings from the collate function
         paths_emb = batch["paths_emb"].to(device)
 
-        # We must align input dims if they mismatch, but the model expects input_dim=132 (128 struct + 4 aux).
-        # We padded `paths_emb` to 132 in collate, leaving the last 4 dims as zeros which is safe since they represent constraints.
+        # The model expects input_dim=132 (128 struct + 4 aux). We padded `paths_emb` to 132
+        # in collate, leaving the last 4 dims as zeros (safe: they represent constraints).
 
         # Forward pass
         optimizer.zero_grad()
@@ -292,8 +291,10 @@ def train_epoch(model, dataloader, optimizer, config, device, epoch):
         else:
             advantages = rewards - rewards.mean()
 
-        # Get log prob of predicted action (argmax)
-        predicted_actions = logits.argmax(dim=-1)  # [B, P, L]
+        # Sample actions from the policy distribution (REINFORCE requires sampling,
+        # not argmax, so the gradient estimate is unbiased).
+        dist = torch.distributions.Categorical(logits=logits)
+        predicted_actions = dist.sample()  # [B, P, L]
 
         # Gather log probs of selected actions
         action_log_probs = log_probs.gather(-1, predicted_actions.unsqueeze(-1)).squeeze(
@@ -396,13 +397,16 @@ def main():
     elif available_ram_gb < 8:
         args.num_workers = min(args.num_workers, 4)
 
-    import functools
-
+    embedding_registry = EmbeddingRegistry()
     dataloader = DataLoader(
         dataset,
         batch_size=config.batch_size,
         shuffle=True,
-        collate_fn=functools.partial(collate_experience, max_paths_limit=config.max_paths),
+        collate_fn=functools.partial(
+            collate_experience,
+            max_paths_limit=config.max_paths,
+            embedding_registry=embedding_registry,
+        ),
         num_workers=args.num_workers,
         pin_memory=True if device.type == "cuda" else False,
     )
@@ -438,12 +442,14 @@ def main():
         print("No pretrained model found, training from scratch")
 
     optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
+    # Create scaler once so its scale history persists across epochs.
+    scaler = torch.amp.GradScaler("cuda", enabled=config.amp)
 
     # Training loop
     best_loss = float("inf")
 
     for epoch in range(config.epochs):
-        loss = train_epoch(model, dataloader, optimizer, config, device, epoch)
+        loss = train_epoch(model, dataloader, optimizer, scaler, config, device, epoch)
         print(f"Epoch {epoch+1}/{config.epochs} - Loss: {loss:.4f}")
 
         # Save checkpoint

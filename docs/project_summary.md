@@ -13,7 +13,7 @@ The project employs a **differentiable, policy-gradient-style framework** to "le
 
 ## 3. Solution Architecture
 
-### A. Model: Multi-Path Transformer (`src/ml/reconv_lib.py`)
+### A. Model: Multi-Path Transformer (`src/ml/core/model.py`)
 The core model is a hierarchical Transformer designed to process multiple reconvergent paths simultaneously and allow them to exchange information.
 
 1.  **Input Embeddings**: The model constructs a rich input representation by concatenating multiple feature vectors.
@@ -49,27 +49,43 @@ Instead of a purely generative approach, the system relies on algorithmic solver
     -   Verifies if a target value at the reconvergence node is logically possible.
     -   **Recursive Regional Consistency**: Uses an optimized `_backtrace_assignment` that checks assignments against constraints on **Exit Lines**. This prevents the solver from accepting locally valid paths that are globally impossible due to path masking.
     -   **Performance Optimization**: Uses an `exit_map` (dictionary-based lookup) to maintain stable O(1) performance during deep recursion, even on complex circuits like `c6288`.
--   **Recursive Justification (`RecursiveStructureSolver`)**:
+-   **Recursive Justification (`HierarchicalReconvSolver`)** (`src/atpg/recursive_reconv_solver.py`):
     -   Utilizes LRR boundaries to prune justification queues, keeping the solver focused on Primary Inputs (PIs) and Exit Lines that directly influence the target reconvergence result.
+    -   **Just-In-Time (JIT) Backtrace**: Replaced upfront path resolution with a lazy algorithm driven by dynamic PI verification queues. Predicts logic only when trace paths topologically intersect a path pair's reconvergent terminus, scaling to wider arrays without upfront enumeration.
+-   **Configurable Backtracking** (`src/atpg/ai_podem.py`):
+    -   `max_backtracks` parameter limits backtracking in the PODEM main loop, preventing runaway search on unsolvable faults.
+    -   Fault values use D/D-bar (DB) representation for correct stuck-at fault propagation.
+-   **Reconvergent Pair Cache** (`src/atpg/reconv_cache.py`):
+    -   Disk-persisted cache storing reconvergent pair topology (node IDs and paths) per `.bench` file.
+    -   Pairs are a pure function of circuit topology and never change between runs; the cache avoids expensive BFS traversals on repeated collection passes.
+    -   Stored in `.reconv_cache/` subdirectory alongside each `.bench` file.
 
-### C. Training Pipeline (`src/ml/train_reconv.py`)
+### C. Training Pipeline (`src/ml/train.py`)
 The training pipeline is designed for end-to-end differentiable training of the policy using the **Gumbel-Softmax estimator**. This technique allows gradients to flow through the discrete 0/1 sampling process, enabling the direct optimization of logic consistency.
 
--   **Loss Function (`reinforce_loss`)**: The total loss is a weighted sum of multiple components designed to guide the model towards logically valid assignments.
+-   **Loss Function (`reinforce_loss`)** (`src/ml/core/loss.py`): The total loss is a weighted sum of multiple components designed to guide the model towards logically valid assignments.
     1.  **Differentiable Logic Losses**: The primary learning signal. Instead of a sparse reward, the model is penalized for logic violations directly.
-        -   **Soft Edge Loss (`soft_edge_lambda`)**: A differentiable penalty based on the Gumbel-Softmax probabilities for violations of local gate logic. Uses a **20.0x weight** for NOT/BUFF gate violations to counter their statistical rarity and deterministic nature.
-        -   **Full Path Logic Loss (`lambda_full_logic`)**: An auxiliary loss that penalizes all edge-level gate logic violations along the entire path.
+        -   **Soft Edge Loss (`soft_edge_lambda`)**: A differentiable penalty based on the Gumbel-Softmax one-hot outputs for violations of local gate logic. NOT and BUFF gate violations carry a **2x weight** to counter their deterministic nature.
+        -   **Full Path Logic Loss (`lambda_full_logic`)**: An auxiliary loss that penalizes all edge-level gate logic violations along the entire path (`calculate_full_logic_loss`). NOT/BUFF also weighted 2x here.
     2.  **Reconvergence Consistency Loss**: An MSE-based penalty on the logits at the reconvergence node to ensure all paths predict the same value.
-    3.  **Anchor Supervision Loss**: A standard Cross-Entropy loss that trains the model to predict a pre-verified "anchor" value at a specific node, providing a strong supervised signal for solvable (SAT) cases.
+    3.  **Anchor Supervision Loss**: A standard Cross-Entropy loss that trains the model to predict a pre-verified "anchor" value at a specific node, providing a strong supervised signal for solvable (SAT) cases. Only applied to samples where `solvability_labels == 0` (SAT).
     4.  **Constrained Curriculum Loss**: A Cross-Entropy loss applied to a subset of nodes that are temporarily "constrained" with ground-truth values from a full logic simulation.
-    5.  **Solvability Loss**: A weighted Cross-Entropy loss for the auxiliary `solvability_head`, which predicts whether a structure is SAT or UNSAT.
+    5.  **Solvability Loss**: A weighted Cross-Entropy loss (UNSAT:SAT weight = 10:1) for the auxiliary `solvability_head`, which predicts whether a structure is SAT or UNSAT.
     6.  **Entropy Regularization (`entropy_beta`)**: Encourages exploration by penalizing overly confident (low-entropy) probability distributions.
 
 -   **Curriculum Learning**: The training process incorporates several curriculum strategies to ease the model into the complex task.
     -   **Constrained Curriculum**: When enabled (`--constrained_curriculum`), the training follows a schedule where the first **25%** of epochs are constraint-free, after which the probability of applying ground-truth constraints ramps up linearly to `max_constraint_prob` over the remaining **75%** of epochs.
     -   **Length Curriculum**: The dataset can be filtered by maximum path length (`--max-len`), allowing the model to be trained on shorter, easier problems first.
 
-### D. DeepGate Integration (`src/ml/gcn.py`)
+-   **Gumbel-Softmax Temperature Annealing**: Temperature decays per epoch as `τ_t = τ₀ × α^(epoch-1)` (default α=0.99, τ₀=1.0, minimum 0.1).
+
+-   **Memory Optimizations**:
+    -   `max_paths` truncation per sample (default 200) to prevent OOM on dense circuits.
+    -   Gradient checkpointing (`--checkpointing`) for VRAM-constrained runs.
+    -   Shard-based lazy dataset loading with configurable LRU cache (`shard_cache_size`).
+    -   AMP (`--amp`) with GradScaler and gradient clipping (max norm 1.0).
+
+### D. DeepGate Integration (`src/ml/data/embedding.py`)
 The project integrates **DeepGate**, a Graph Neural Network (GNN)-based model, to provide high-fidelity circuit embeddings.
 
 1.  **Structural & Functional Embeddings**: DeepGate generates 128-dimensional embeddings for every node in the circuit.
@@ -77,32 +93,59 @@ The project integrates **DeepGate**, a Graph Neural Network (GNN)-based model, t
     -   **Functional Embedding (`hf`)**: Captures the logical role and input-output relationships.
 2.  **Environment Management**: DeepGate runs in its own Conda environment (`deepgate`) and is dynamically imported into the S-Imply pipeline via manual `sys.path` configuration.
 3.  **Circuit Pre-processing**: Circuits are converted to AIG (And-Inverter Graph) format before being passed to DeepGate's `BenchParser`.
+4.  **Disk Caching**: Embeddings are cached per circuit in `.deepgate_cache/` subdirectories to avoid redundant inference across runs.
 
-### F. RL Training Pipeline Rerun (Multi-Dataset)
-**Timestamp: 2026-02-24**
-Initiated a comprehensive RL training rerun to optimize path selection and logic consistency across a broader range of topologies.
-- **Datasets**: Combined `ISCAS85` and `iscas89` benchmarks (17 circuits total).
-- **Configuration**:
-    - **Experience Collection**: 1000 faults per circuit (500 per GPU) using the current best candidate.
-    - **Training**: 50 epochs, Batch Size 4096, Max Paths 250 (Stabilized VRAM).
-    - **Hardware**: Parallelized across 2x 16GB GPUs.
-- **Goal**: Improve the model's ability to handle complex reconvergence in sequential-like structures (ISCAS89) and further reduce `✗ Convergence Path Invalid` failures observed in dense combinational logic (`c1908`).
+### E. RL Training Pipeline (`scripts/`)
+An offline RL pipeline supplements supervised training with experience collected from live AI-PODEM runs.
+
+-   **Experience Collection** (`scripts/collect_experience.py`):
+    -   Runs AI-PODEM on ISCAS85/89 benchmark circuits, recording model inputs and outcomes at each solver call.
+    -   Uses `ExperienceRecorder` (`src/ml/rl/rl_recorder.py`) to buffer and periodically flush episodes to disk as `batch_*.pkl` files.
+    -   **Reward shaping**: `+10 - 0.001×backtracks` for success, `-5 - 0.001×backtracks` for failure, `-10` for exceptions.
+    -   Supports multi-GPU parallelism via `run_rl_pipeline.py`, which distributes benchmark files across GPUs.
+    -   `HierarchicalReconvSolver` is passed the `recorder` instance so it can log step-level data. Pair topology is persisted to disk cache (`reconv_cache.py`) after each circuit.
+
+-   **RL Model Training** (`scripts/train_rl.py`):
+    -   Loads experience batches from disk via `ExperienceDataset` with LRU file-level caching.
+    -   Reconstructs DeepGate embeddings from `EmbeddingRegistry` during collation.
+    -   Uses classic REINFORCE (policy gradient): `loss = -log_prob(action) × advantage`.
+    -   Advantages are reward-normalized per batch.
+    -   Entropy bonus (`entropy_beta`) encourages exploration.
+    -   Saves best checkpoint by lowest training loss.
+
+-   **Pipeline Orchestration** (`scripts/run_rl_pipeline.py`):
+    -   Three stages selectable independently: `--collect`, `--train`, `--benchmark`.
+    -   `--all` runs the full pipeline end-to-end.
+    -   Automatically caps parallel GPU processes based on available RAM (assumes ~5 GB per process).
 
 ---
 
 ## 4. Project Structure & Key Files
 
 -   **`src/atpg/`**:
-    -   `reconv_podem.py`: Primary logic for finding reconvergent paths and the validation solver (`PathConsistencySolver`).
-    -   `logic_sim_three.py`: 3-valued logic simulator (0, 1, X) for fault simulation.
+    -   `podem.py`: Standard PODEM implementation with SCOAP heuristics and D/DB fault propagation.
+    -   `reconv_podem.py`: Beam-search reconvergent pair discovery and `PathConsistencySolver`.
+    -   `ai_podem.py`: AI-augmented PODEM integrating `HierarchicalReconvSolver` into the backtrace loop. Includes `post_process_logic_gates()` for deterministic gate correction.
+    -   `recursive_reconv_solver.py`: `HierarchicalReconvSolver` with JIT backtrace and PI verification queues.
+    -   `reconv_cache.py`: Disk-persisted cache for reconvergent pair topology per `.bench` file.
+    -   `logic_sim_three.py`: 3-valued logic simulator (0, 1, X, D, DB) for fault simulation.
 -   **`src/ml/`**:
-    -   `reconv_lib.py`: PyTorch implementation of the `MultiPathTransformer`.
-    -   `train_reconv.py`: Main training loop, loss calculation, and metric tracking.
-    -   `reconv_ds.py`: Dataset loader for pre-processed circuit paths.
-    -   `embedding_extractor.py`: Converts circuit netlists (BENCH/AIG) into embedding-ready tensors.
+    -   `core/model.py`: PyTorch implementation of `MultiPathTransformer`.
+    -   `core/loss.py`: `reinforce_loss`, `calculate_consistency_loss`, `calculate_full_logic_loss`.
+    -   `core/dataset.py`: `ReconvergentPathsDataset` with sharded lazy loading, anchor injection, and constraint injection.
+    -   `data/embedding.py`: DeepGate integration — AIG conversion, 128D embedding extraction, disk caching.
+    -   `rl/rl_recorder.py`: `ExperienceRecorder` for buffering and saving RL episodes.
+    -   `rl/env.py`: RL environment definition.
+    -   `train.py`: Main supervised training loop with curriculum, AMP, gradient accumulation config, and LR scheduling.
+-   **`scripts/`**:
+    -   `collect_experience.py`: AI-PODEM rollout collection with exploration.
+    -   `train_rl.py`: REINFORCE-based RL fine-tuning from collected experience.
+    -   `run_rl_pipeline.py`: Unified pipeline orchestrator (collect → train → benchmark).
+    -   `benchmark_c432_compare.py`: Vanilla vs AI-PODEM performance comparison.
 -   **`data/`**:
-    -   `bench/`: ISCAS85/89, ITC99 benchmark circuits.
-    -   `datasets/`: Serialized datasets.
+    -   `bench/ISCAS85/`, `bench/iscas89/`, `bench/ITC99/`: Benchmark circuit netlists.
+    -   `datasets/reconv_dataset.pkl`: Serialized raw dataset.
+    -   `datasets/reconv_shards_v3/`: Pre-processed tensor shards for lazy loading.
 
 ## 5. Metrics & Validation
 The following metrics are used to evaluate model performance:
@@ -149,12 +192,6 @@ Diagnostic analysis of 185-epoch trained model revealed NOT gates as sole failur
 | **Edge errors (1280 samples)** | 518 | **52** | **-90%** |
 | **Reconvergence failures** | 0 | 0 | ±0 |
 
-## 7. Current Challenges & Roadmap
--   **Handling "Don't Cares" (X)**: The current model predicts binary 0/1. Integrating explicit X prediction or X-tolerance in the loss function is an ongoing area of research.
--   **Complex Reconvergence**: Scaling from pair-wise paths to N-ary reconvergent structures.
--   **Integration with Commercial ATPG**: Using the model's predictions as high-quality initial heuristics for industry-standard ATPG tools.
--   **Remaining Edge Errors (~3.2%)**: Post-processing fixes NOT/BUFF but AND/OR/NAND/NOR inequality violations remain. Consider iterative refinement or autoregressive decoding for further improvement.
-
 ### D. Training Pipeline Repair & Optimization
 **Timestamp: 2026-02-17**
 Resolved critical pipeline failures and implemented SSD-optimized data loading:
@@ -165,7 +202,22 @@ Resolved critical pipeline failures and implemented SSD-optimized data loading:
 ### E. Just-In-Time Architecture & AI Consistency Enforcement
 **Timestamp: 2026-02-20**
 Rewrote `HierarchicalReconvSolver` to replace upfront path resolution with a "Just-In-Time" backtrace algorithm driven by dynamic PI verification queues.
--   **Dynamic Instantiation:** Predicts logic only when trace paths topologicaly intersect a path pair's reconvergent terminus, scaling effortlessly to wider arrays.
+-   **Dynamic Instantiation:** Predicts logic only when trace paths topologically intersect a path pair's reconvergent terminus, scaling effortlessly to wider arrays.
 -   **Context Merging:** Plumbed `ai_podem.py` constraints implicitly through to model tensor structures (`batch_embs[128:130]`) alongside deterministic fallback verifications over XOR/XNOR topologies.
--   **Logic Tying:** Tested via benchmark validation on `c432.bench 329-0`. The backtracking model natively rejects hallucinated outputs yielding unresolvable constraints upstream, collapsing conflicting trees logically while accepting sound traces dynamically. 
+-   **Logic Tying:** Tested via benchmark validation on `c432.bench 329-0`. The backtracking model natively rejects hallucinated outputs yielding unresolvable constraints upstream, collapsing conflicting trees logically while accepting sound traces dynamically.
 
+### F. RL Training Pipeline & PODEM Hardening
+**Timestamp: 2026-02-24**
+Initiated comprehensive RL training rerun and stabilized the PODEM core:
+-   **Datasets**: Combined `ISCAS85` and `iscas89` benchmarks (17 circuits total).
+-   **Configuration**: 1000 faults per circuit (500 per GPU), 50 training epochs, batch size 4096, max paths 250. Hardware: 2× 16 GB GPUs.
+-   **PODEM Hardening**: Added configurable `max_backtracks` to the PODEM main loop. Updated fault representation to D/DB notation for correct stuck-at propagation.
+-   **Reconvergent Pair Cache**: Added `reconv_cache.py` to persist pair topology to disk, eliminating repeated BFS traversals on subsequent collection passes.
+-   **Goal**: Improve the model's ability to handle complex reconvergence in sequential-like structures (ISCAS89) and further reduce `✗ Convergence Path Invalid` failures observed in dense combinational logic (`c1908`).
+
+## 7. Current Challenges & Roadmap
+-   **Handling "Don't Cares" (X)**: The current model predicts binary 0/1. Integrating explicit X prediction or X-tolerance in the loss function is an ongoing area of research.
+-   **Complex Reconvergence**: Scaling from pair-wise paths to N-ary reconvergent structures.
+-   **Integration with Commercial ATPG**: Using the model's predictions as high-quality initial heuristics for industry-standard ATPG tools.
+-   **Remaining Edge Errors (~3.2%)**: Post-processing fixes NOT/BUFF but AND/OR/NAND/NOR inequality violations remain. Consider iterative refinement or autoregressive decoding for further improvement.
+-   **XOR/XNOR Handling**: Low fault coverage on c432 due to XOR logic in the D-frontier. Under active investigation.

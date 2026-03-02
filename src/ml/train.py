@@ -137,6 +137,15 @@ def make_dataloaders(cfg: TrainConfig, device: torch.device) -> Tuple[DataLoader
     if cfg.max_paths > 0:
         final_collate_fn = functools.partial(reconv_collate, max_paths=cfg.max_paths)
 
+    # CAPPING: Shard cache size per worker (compute before dataset construction)
+    effective_shard_cache = cfg.shard_cache_size
+    if cfg.num_workers >= 4 and effective_shard_cache > 2:
+        print(
+            f"[RECONV-MEM] High worker count ({cfg.num_workers}). "
+            "Capping shard_cache_size to 2 per worker."
+        )
+        effective_shard_cache = 2
+
     print(f"Creating dataset (device={dataset_device})...", flush=True)
     dataset = ReconvergentPathsDataset(
         cfg.dataset,
@@ -147,7 +156,7 @@ def make_dataloaders(cfg: TrainConfig, device: torch.device) -> Tuple[DataLoader
         add_logic_value=cfg.add_logic_value,
         anchor_in_dataset=cfg.dataset_anchor_hint,
         max_len_filter=cfg.max_len,
-        cache_size=cfg.shard_cache_size,
+        cache_size=effective_shard_cache,
         inject_constraints=cfg.inject_constraints,
         constraint_prob=cfg.max_constraint_prob if cfg.inject_constraints else 0.0,
     )
@@ -168,14 +177,6 @@ def make_dataloaders(cfg: TrainConfig, device: torch.device) -> Tuple[DataLoader
             f"[RECONV-MEM] Large batch size ({cfg.batch_size}). "
             f"Reducing prefetch_factor to {prefetch} to save RAM."
         )
-
-    # CAPPING: Shard cache size per worker
-    if cfg.num_workers >= 4 and cfg.shard_cache_size > 2:
-        print(
-            f"[RECONV-MEM] High worker count ({cfg.num_workers}). "
-            "Capping shard_cache_size to 2 per worker."
-        )
-        cfg.shard_cache_size = 2
 
     # Use workers and pinned memory for faster host->device transfer when on CUDA
     if device.type == "cuda":
@@ -231,7 +232,7 @@ def train_one_epoch(
     model: nn.Module,
     loader: DataLoader,
     optim: torch.optim.Optimizer,
-    scaler: torch.cuda.amp.GradScaler,
+    scaler: torch.amp.GradScaler,
     device: torch.device,
     cfg: TrainConfig,
     epoch: int = 1,
@@ -245,9 +246,6 @@ def train_one_epoch(
         0.0,
     )
     total_trivial = 0.0  # Stores constraint violation rate
-
-    time.time()
-    bdone = 0
 
     # Target batch count for ETA
     try:
@@ -277,9 +275,10 @@ def train_one_epoch(
             constraint_prob = cfg.max_constraint_prob * ramp_progress
 
     if cfg.verbose:
+        free_epochs_disp = cfg.epochs // 4
         print(
             f"[curriculum] epoch={epoch} constraint_prob={constraint_prob:.3f} "
-            f"(Phase {'1' if epoch <= cfg.epochs // 2 else '2'})"
+            f"(Phase {'1' if epoch <= free_epochs_disp else '2'})"
         )
 
     if cfg.verbose:
@@ -288,17 +287,25 @@ def train_one_epoch(
 
     for batch_idx, batch in enumerate(pbar):
         pbar.set_description(f"Epoch {epoch}")
-        paths = batch["paths_emb"].to(device)
-        masks = batch["attn_mask"].to(device)
-        node_ids = batch["node_ids"].to(device)
+        paths = batch["paths_emb"].to(device, non_blocking=True)
+        masks = batch["attn_mask"].to(device, non_blocking=True)
+        node_ids = batch["node_ids"].to(device, non_blocking=True)
         files = batch["files"]
-        c_mask = batch["constraint_mask"].to(device) if "constraint_mask" in batch else None
-        c_vals = batch["constraint_vals"].to(device) if "constraint_vals" in batch else None
+        c_mask = (
+            batch["constraint_mask"].to(device, non_blocking=True)
+            if "constraint_mask" in batch
+            else None
+        )
+        c_vals = (
+            batch["constraint_vals"].to(device, non_blocking=True)
+            if "constraint_vals" in batch
+            else None
+        )
 
         # 1. Initialize Logic Value Vector to "Unknown" [0, 0, 1] ONLY IF dataset didn't do it
         # (inject_constraints=True in dataset already handles this)
         if cfg.add_logic_value and not cfg.inject_constraints:
-            B_cur, P_cur, L_cur, D_cur = paths.shape
+            D_cur = paths.shape[-1]
             if D_cur >= 3:
                 # We initialize to [0, 0, 1] (Unknown)
                 paths[..., D_cur - 3] = 0.0
@@ -392,13 +399,15 @@ def train_one_epoch(
             optim.zero_grad(set_to_none=True)
             continue
 
-        scaler.scale(loss_val).backward()
-        # Gradient clipping to prevent AMP-induced explosions
-        scaler.unscale_(optim)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        scaler.step(optim)
-        scaler.update()
-        optim.zero_grad(set_to_none=True)
+        scaler.scale(loss_val / cfg.grad_accum).backward()
+
+        if (batch_idx + 1) % cfg.grad_accum == 0:
+            # Gradient clipping to prevent AMP-induced explosions
+            scaler.unscale_(optim)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optim)
+            scaler.update()
+            optim.zero_grad(set_to_none=True)
 
         total_loss += float(loss_val.item())
         total_reward += float(avg_reward.mean().item())
@@ -406,7 +415,6 @@ def train_one_epoch(
         total_edge_acc += float(batch_edge_acc.mean().item())
         total_trivial += float(batch_c_viol.mean().item())
         total_batches += 1
-        bdone += paths.size(0)
 
         # 4. RAM AWARENESS in main loop
         if (batch_idx + 1) % 50 == 0:
@@ -426,6 +434,7 @@ def train_one_epoch(
                 node_ids,
                 masks,
                 files,
+                gate_types=gtypes,
                 anchor_p=anchor_p,
                 anchor_l=anchor_l,
                 anchor_v=anchor_v,
@@ -441,9 +450,6 @@ def train_one_epoch(
                     "reconv": f"{dbg['reconv_match_rate']:.3f}",
                 }
             )
-
-        if cfg.max_train_batches > 0 and (batch_idx + 1) >= cfg.max_train_batches:
-            break
 
         if cfg.max_train_batches > 0 and (batch_idx + 1) >= cfg.max_train_batches:
             break
@@ -582,6 +588,7 @@ def evaluate(
                 node_ids,
                 masks,
                 files,
+                gate_types=gtypes,
                 anchor_p=anchor_p,
                 anchor_l=anchor_l,
                 anchor_v=anchor_v,
@@ -691,8 +698,6 @@ def cmd_train(args: argparse.Namespace) -> None:
         "Probing dataset dimensions...",
         flush=True,
     )
-    import time
-
     start_time = time.time()
 
     # Get a single sample directly from the underlying dataset
@@ -830,9 +835,9 @@ def cmd_train(args: argparse.Namespace) -> None:
                 best=False,
             )
 
-        # Save best by validation reward (maximize)
-        if (-va_reward) < best_val:
-            best_val = -va_reward
+        # Save best by validation loss (minimize)
+        if va_loss < best_val:
+            best_val = va_loss
             save_checkpoint(os.path.join(cfg.output, "best_model.pth"), model, cfg, best=True)
 
 

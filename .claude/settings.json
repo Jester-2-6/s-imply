@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(conda run -n deepgate ruff check .)",
+      "Bash(conda run -n deepgate ruff check src/ml/train.py)",
+      "Bash(conda run -n deepgate pyright --version)",
+      "Bash(conda run -n deepgate mypy src/ml/train.py src/ml/evaluate.py scripts/train_rl.py --ignore-missing-imports --no-strict-optional)",
+      "Bash(conda run -n deepgate python -c \"import pyright\")",
+      "Bash(conda run -n deepgate python -m pyright --version)"
+    ]
+  }
+}

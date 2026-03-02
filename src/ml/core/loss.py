@@ -102,34 +102,6 @@ def calculate_consistency_loss(
     return loss.sum() / valid_count
 
 
-def policy_loss_and_metrics(
-    logits: torch.Tensor,
-    node_ids: torch.Tensor,
-    mask_valid: torch.Tensor,
-    files: list[str],
-    gate_types: torch.Tensor,
-    # Constraints
-    constraint_mask: torch.Tensor | None = None,
-    constraint_vals: torch.Tensor | None = None,
-    # Anchors
-    anchor_p: torch.Tensor | None = None,
-    anchor_l: torch.Tensor | None = None,
-    anchor_v: torch.Tensor | None = None,
-    solvability_logits: torch.Tensor | None = None,
-    solvability_labels: torch.Tensor | None = None,
-    anchor_alpha: float = 0.1,
-    normalize_reward: bool = True,
-    entropy_beta: float = 0.0,
-    soft_edge_lambda: float = 1.0,
-) -> tuple[torch.Tensor, float, float, float, float]:
-    """Compute REINFORCE loss with LUT-inspired constraints and reconv consistency.
-
-    Returns: (loss, avg_reward, valid_rate, edge_acc, constraint_violation_rate)
-    """
-
-    B, P, L, C = logits.shape
-
-
 def calculate_logic_loss(
     node_ids: torch.Tensor,  # [B, P, L]
     gate_types: torch.Tensor,  # [B, P, L]
@@ -363,6 +335,8 @@ def reinforce_loss(
     normalize_reward: bool = True,
     anchor_alpha: float = 0.1,
     gumbel_temp: float = 1.0,
+    lambda_solvability: float = 1.0,
+    lambda_constraint: float = 1.0,
 ) -> tuple[torch.Tensor, float, float, float, float]:
     """Compute Loss using Gumbel-Softmax for differentiable logic consistency.
 
@@ -401,7 +375,7 @@ def reinforce_loss(
             c_loss = F.cross_entropy(
                 flat_logits[valid_constraints], flat_targets[valid_constraints]
             )
-            constraint_loss = c_loss * 1.0
+            constraint_loss = c_loss * lambda_constraint
 
             # Metric: Violation rate
             preds = actions[constraint_mask]
@@ -429,7 +403,8 @@ def reinforce_loss(
     if solvability_logits is not None and solvability_labels is not None:
         weights = torch.tensor([10.0, 1.0], device=logits.device)
         solvability_loss = (
-            F.cross_entropy(solvability_logits, solvability_labels, weight=weights) * 1.0
+            F.cross_entropy(solvability_logits, solvability_labels, weight=weights)
+            * lambda_solvability
         )
 
     # RL Reward Logic (For Logging Only)
@@ -522,6 +497,8 @@ def reinforce_loss(
             torch.min(local_reward_shaping, torch.tensor(reconv_penalty, device=logits.device)),
         )
         reward = sat_base_reward.clone()
+        # Incorporate solvability prediction reward signal
+        reward = reward + unsat_reward
         avg_reward = reward.mean()
 
     # -----------------------------------------------------------------------
@@ -647,6 +624,7 @@ def _debug_metrics_from_logits(
     node_ids: torch.Tensor,
     mask_valid: torch.Tensor,
     files: list[str],
+    gate_types: Optional[torch.Tensor] = None,
     anchor_p: Optional[torch.Tensor] = None,
     anchor_l: Optional[torch.Tensor] = None,
     anchor_v: Optional[torch.Tensor] = None,
@@ -666,6 +644,41 @@ def _debug_metrics_from_logits(
         if solvability_logits is not None and solvability_labels is not None:
             pred_solv = solvability_logits.argmax(dim=-1)
             solv_acc = (pred_solv == solvability_labels).float().mean().item()
+
+        # Edge Accuracy (requires gate_types)
+        edge_acc = 1.0
+        edges_per_sample = 0.0
+        if gate_types is not None:
+            valid_edges = mask_valid[:, :, 1:] & mask_valid[:, :, :-1]
+            prev_vals = actions[:, :, :-1]
+            cur_vals = actions[:, :, 1:]
+            gt_cur = gate_types[:, :, 1:]
+
+            edge_ok = torch.ones_like(prev_vals, dtype=torch.bool)
+            edge_ok[gt_cur == GateType.NOT] &= (
+                cur_vals[gt_cur == GateType.NOT] == (1 - prev_vals[gt_cur == GateType.NOT])
+            )
+            edge_ok[gt_cur == GateType.BUFF] &= (
+                cur_vals[gt_cur == GateType.BUFF] == prev_vals[gt_cur == GateType.BUFF]
+            )
+            edge_ok[gt_cur == GateType.AND] &= (
+                cur_vals[gt_cur == GateType.AND] <= prev_vals[gt_cur == GateType.AND]
+            )
+            edge_ok[gt_cur == GateType.NAND] &= (
+                cur_vals[gt_cur == GateType.NAND] >= (1 - prev_vals[gt_cur == GateType.NAND])
+            )
+            edge_ok[gt_cur == GateType.OR] &= (
+                cur_vals[gt_cur == GateType.OR] >= prev_vals[gt_cur == GateType.OR]
+            )
+            edge_ok[gt_cur == GateType.NOR] &= (
+                cur_vals[gt_cur == GateType.NOR] <= (1 - prev_vals[gt_cur == GateType.NOR])
+            )
+
+            wrong = (~edge_ok) & valid_edges
+            total_edges = valid_edges.sum().item()
+            wrong_edges = wrong.sum().item()
+            edge_acc = (total_edges - wrong_edges) / max(1.0, total_edges)
+            edges_per_sample = total_edges / max(1, B)
 
         # Reconvergence Consistency (Do all paths in a sample agree on the terminal value?)
         path_len = mask_valid.long().sum(dim=-1)
@@ -687,8 +700,8 @@ def _debug_metrics_from_logits(
         reconv_match = match_count / max(1, total_reconv_samples)
 
         return {
-            "edge_acc": 1.0,  # Placeholder as we don't have gate_types
+            "edge_acc": edge_acc,
             "reconv_match_rate": reconv_match,
             "solvability_acc": solv_acc,
-            "edges_per_sample": 0.0,
+            "edges_per_sample": edges_per_sample,
         }

@@ -11,8 +11,8 @@ import argparse
 
 import torch
 
-from src.ml.core.dataset import ReconvergentPathsDataset, reconv_collate
-from src.ml.core.loss import policy_loss_and_metrics
+from src.ml.core.dataset import ReconvergentPathsDataset, reconv_collate, resolve_gate_types
+from src.ml.core.loss import reinforce_loss
 from src.ml.core.model import MultiPathTransformer
 
 
@@ -24,6 +24,7 @@ def evaluate(model: MultiPathTransformer, loader) -> tuple[float, float, float]:
     required output (zero constraint violations).
     """
     model.eval()
+    device = next(model.parameters()).device
     total_loss = 0.0
     total_reward = 0.0
     total_correct = 0
@@ -31,13 +32,22 @@ def evaluate(model: MultiPathTransformer, loader) -> tuple[float, float, float]:
     total_batches = 0
 
     for batch in loader:
-        paths = batch["paths_emb"]
-        masks = batch["attn_mask"]
-        node_ids = batch["node_ids"]
+        paths = batch["paths_emb"].to(device)
+        masks = batch["attn_mask"].to(device)
+        node_ids = batch["node_ids"].to(device)
         files = batch["files"]
+        gtypes = (
+            batch["gate_types"].to(device)
+            if "gate_types" in batch
+            else resolve_gate_types(node_ids, files, device)
+        )
 
-        logits = model(paths, masks)
-        loss, avg_reward, valid_rate = policy_loss_and_metrics(logits, node_ids, masks, files)
+        logits, _solv_logits = model(paths, masks, gate_types=gtypes)
+        loss, avg_reward, valid_rate, _edge_acc, _c_viol = reinforce_loss(
+            logits=logits,
+            gate_types=gtypes,
+            mask_valid=masks,
+        )
         total_loss += float(loss.item())
         total_reward += float(avg_reward)
 

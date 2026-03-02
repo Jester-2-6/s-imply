@@ -45,7 +45,7 @@ class ExperienceRecorder:
         if not os.path.exists(save_dir):
             os.makedirs(save_dir, exist_ok=True)
 
-    def start_episode(self, episode_id: str = None):
+    def start_episode(self, episode_id: str | None = None):
         self.episode_id = episode_id or str(uuid.uuid4())
         self.current_episode_steps = []
 
