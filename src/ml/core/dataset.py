@@ -665,8 +665,6 @@ class ReconvergentPathsDataset(Dataset):
         - value: Logic value (0 or 1) at anchor point (-1 if no anchor)
         - solvability: 1 if structure is SAT, 0 if UNSAT or unknown
         """
-        from src.util.struct import LogicValue
-
         if "pair_info" in info:
             pair_info = info["pair_info"]
         elif all(k in info for k in ["start", "reconv", "paths"]):
@@ -692,50 +690,24 @@ class ReconvergentPathsDataset(Dataset):
         if assignment is None:
             return -1, -1, -1, 0
 
-        # Solvable! Now select an intelligent anchor point
-        # Strategy: Pick a node from the middle 50% of any path
+        # Solvable! Anchor strictly at the terminus (reconvergence node = last position on path 0).
+        # All paths share the same terminus (the reconvergence node), so path 0, last position
+        # is canonical. This gives the model the "given" target value for back-implication.
         paths = pair_info["paths"]
-        path_node_sets = [set(p) for p in paths]
+        reconv_node = pair_info["reconv"]
 
-        # Find nodes in assignment that are on paths
-        candidates = []
-        for node_id, logic_val in assignment.items():
-            if logic_val in [LogicValue.ZERO, LogicValue.ONE]:
-                # Check which path contains this node
-                for p_idx, node_set in enumerate(path_node_sets):
-                    if node_id in node_set:
-                        # Find position in path
-                        try:
-                            l_idx = paths[p_idx].index(node_id)
-                            path_len = len(paths[p_idx])
-                            # Prefer middle 50% of path
-                            rel_pos = l_idx / max(1, path_len - 1)
-                            if 0.25 <= rel_pos <= 0.75:
-                                priority = 1.0
-                            else:
-                                priority = 0.5
+        # Terminus is the last node on path 0 (== reconv node, shared by all paths)
+        p_idx = 0
+        l_idx = len(paths[0]) - 1
 
-                            candidates.append(
-                                {
-                                    "p_idx": p_idx,
-                                    "l_idx": l_idx,
-                                    "value": 1 if logic_val == LogicValue.ONE else 0,
-                                    "priority": priority,
-                                }
-                            )
-                        except ValueError:
-                            continue
-
-        # Select best candidate
-        if not candidates:
-            # No good anchor found, but structure is solvable
+        reconv_lv = assignment.get(reconv_node)
+        # _solve_sample_assignment returns int values; accept 0 or 1 only
+        if reconv_lv not in (0, 1):
+            # Solver didn't assign a concrete 0/1 to the reconv node; solvable but no anchor
             return -1, -1, -1, 1
 
-        # Sort by priority (prefer middle positions)
-        candidates.sort(key=lambda x: x["priority"], reverse=True)
-        best = candidates[0]
-
-        return best["p_idx"], best["l_idx"], best["value"], 1
+        value = int(reconv_lv)  # already 0 or 1
+        return p_idx, l_idx, value, 1
 
     # ------------------------------
     # Processed shard helpers
@@ -885,17 +857,6 @@ class ReconvergentPathsDataset(Dataset):
             # info is available in entry['info']
             p_sel, l_sel, v_sel, s_sel = raw_ds._gen_anchor_for_sample(ni, am, file_path, info)
 
-            # If valid, we might inject into embedding?
-            # Ideally we save the "clean" embedding and inject at runtime?
-            # Or inject now? If we inject now, we bake in the anchor.
-            # Baking in is faster.
-            if p_sel >= 0 and l_sel >= 0 and raw_ds.add_logic_value and pe.shape[-1] >= 3:
-                D = pe.shape[-1]
-                onehot = torch.tensor([1.0, 0.0, 0.0])
-                if v_sel == 1:
-                    onehot = torch.tensor([0.0, 1.0, 0.0])
-                pe[p_sel, l_sel, D - 3 : D] = onehot
-
             # GENERATE CONSTRAINTS (bake into shard)
             c_mask = torch.zeros_like(ni, dtype=torch.bool)
             c_vals = torch.zeros_like(ni, dtype=torch.long)
@@ -909,6 +870,15 @@ class ReconvergentPathsDataset(Dataset):
                         c_vals[mask] = int(val)
                         vec = torch.tensor([1.0, 0.0, 0.0] if val == 0 else [0.0, 1.0, 0.0])
                         pe.view(-1, D)[mask.view(-1), D - 3 : D] = vec
+
+            # Inject anchor AFTER constraints so it cannot be overwritten.
+            # The anchor is the primary supervision signal; constraints are secondary.
+            if p_sel >= 0 and l_sel >= 0 and raw_ds.add_logic_value and pe.shape[-1] >= 3:
+                D = pe.shape[-1]
+                onehot = torch.tensor([1.0, 0.0, 0.0])
+                if v_sel == 1:
+                    onehot = torch.tensor([0.0, 1.0, 0.0])
+                pe[p_sel, l_sel, D - 3 : D] = onehot
 
             # Pad strictly to max_path_length for stacking
             Pdim, Lcur, Ddim = pe.shape
@@ -1222,29 +1192,17 @@ def _generate_anchor(
         # We CANNOT run the exact same logic without pair_info
         # (which contains reconvergence details)
 
-        # Fallback: Just pick a random gate near the end of a path?
-        # And check solvability from PI?
-        # Without pair_info, we can't restrict to the specific reconvergence pair logic easily.
-        # But maybe PathConsistencySolver just needs circuit?
-        # dataset.py:235 assignment = solver.solve(pair_info, target_lv)
-        # It needs pair_info (start/end nodes).
-
-        # If we are here, it means the dataset didn't provide anchors.
-        # We can implement a simplified anchor choice: pick random node, assign random val.
-        # Is it sizable? We'll check with solver if we can deduce pairwise info
-        # or just standard consistency.
-
-        # For valid training, we really should have anchors from dataset pre-generation.
-        # Check train.py calls:
-        # ap_cpu, al_cpu, av_cpu, s_cpu = _generate_anchor(..., files, ...)
-
-        # If we implement a dummy version that returns "no anchor" (-1),
-        # training proceeds but without that specific signal.
-        # Given we are "fixing" the pipeline, and exact reconstruction is hard without data,
-        # we'll return -1 (no anchor) for now to allow running.
-
-        ap[b] = -1
-        al[b] = -1
+        # The reconvergence node is always the LAST valid position on every path
+        # (paths are ordered [stem -> intermediate -> reconv]). We can extract it
+        # from the attn_mask alone without pair_info or a solver call.
+        path_len = int(attn_mask[b, 0].long().sum().item())
+        if path_len >= 1:
+            ap[b] = 0                    # path 0 (all paths share the same terminal)
+            al[b] = path_len - 1         # last valid position
+            # av[b] is already set to prefer_value above; keep it.
+        else:
+            ap[b] = -1
+            al[b] = -1
 
     return ap, al, av, sv
 

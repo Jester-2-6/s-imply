@@ -28,6 +28,7 @@ class AiPodemConfig:
     enable_ai_activation: bool = True
     enable_ai_propagation: bool = True
     verbose: bool = False
+    no_fallback: bool = False  # If True, never fall back to classic backtrace/PODEM
 
 
 class AIBacktracer:
@@ -36,10 +37,13 @@ class AIBacktracer:
     Falls back to simple_backtrace if AI fails.
     """
 
-    def __init__(self, solver: HierarchicalReconvSolver, verbose: bool = False):
+    def __init__(
+        self, solver: HierarchicalReconvSolver, verbose: bool = False, no_fallback: bool = False
+    ):
         self.solver = solver
         self.circuit = solver.circuit
         self.verbose = verbose
+        self.no_fallback = no_fallback
         # Precompute PI indices to avoid O(N) iteration in every __call__
         self.pi_indices = [i for i, g in enumerate(self.circuit) if g.type == GateType.INPT]
 
@@ -57,6 +61,11 @@ class AIBacktracer:
                     pairs = self.solver.pair_cache[objective.gate_id]
 
                 if not pairs:
+                    if self.no_fallback:
+                        raise RuntimeError(
+                            f"[AI-BT] No reconv pairs for gate {objective.gate_id}"
+                            " and fallback is disabled."
+                        )
                     if self.verbose:
                         print(
                             f"  [AI-BT] No reconv pairs for gate {objective.gate_id}, skipping AI."
@@ -123,6 +132,11 @@ class AIBacktracer:
                 traceback.print_exc()
             pass
 
+        if self.no_fallback:
+            raise RuntimeError(
+                f"[AI-BT] AI backtrace failed for gate {objective.gate_id}"
+                " and fallback is disabled."
+            )
         # Fallback to simple
         if self.verbose:
             print("  [AI-BT] Fallback to simple_backtrace")
@@ -315,23 +329,41 @@ class ModelPairPredictor(ReconvPairPredictor):
                 if nid in self.gate_mapping:
                     aig_id = self.gate_mapping[nid]
                     if aig_id < self.struct_emb.size(0):
-                        p_emb.append(self.struct_emb[aig_id])
+                        p_emb.append(self.struct_emb[aig_id].clone())
                     else:
                         p_emb.append(torch.zeros(128, device=self.device))
                 else:
                     p_emb.append(torch.zeros(128, device=self.device))
-                # Pad to 132 (4 extra logic dims)
-                if len(p_emb[-1]) < 132:
-                    pad = torch.zeros(132 - len(p_emb[-1]), device=self.device)
-                    p_emb[-1] = torch.cat([p_emb[-1], pad])
+
+                # Pad to 131 (3 logic dims) matching training encoding:
+                #   dim 128: val=0 (ZERO)
+                #   dim 129: val=1 (ONE)
+                #   dim 130: unknown (default 1.0)
+                if p_emb[-1].shape[0] < 131:
+                    logic_dims = torch.zeros(131 - p_emb[-1].shape[0], device=self.device)
+                    p_emb[-1] = torch.cat([p_emb[-1], logic_dims])
 
                 if nid in constraints:
                     val = constraints[nid]
-                    p_emb[-1][128] = 1.0  # is_constrained
                     if val == LogicValue.ZERO:
-                        p_emb[-1][129] = 1.0
+                        p_emb[-1][128] = 1.0  # val=0
+                        p_emb[-1][129] = 0.0  # val=1
+                        p_emb[-1][130] = 0.0  # unknown
                     elif val == LogicValue.ONE:
-                        p_emb[-1][130] = 1.0
+                        p_emb[-1][128] = 0.0  # val=0
+                        p_emb[-1][129] = 1.0  # val=1
+                        p_emb[-1][130] = 0.0  # unknown
+                else:
+                    # Unknown: [0, 0, 1] — matches training default
+                    p_emb[-1][128] = 0.0
+                    p_emb[-1][129] = 0.0
+                    p_emb[-1][130] = 1.0
+
+                # Pad to 132 (next multiple of 4) to satisfy nhead divisibility
+                if p_emb[-1].shape[0] < 132:
+                    p_emb[-1] = torch.cat(
+                        [p_emb[-1], torch.zeros(132 - p_emb[-1].shape[0], device=self.device)]
+                    )
 
                 # Gate Type
                 if nid < len(self.circuit):
@@ -341,7 +373,10 @@ class ModelPairPredictor(ReconvPairPredictor):
 
             # Pad sequence
             while len(p_emb) < max_len:
-                p_emb.append(torch.zeros(132, device=self.device))
+                # Padding slots: struct zeros + unknown logic + zero pad
+                pad_emb = torch.zeros(132, device=self.device)
+                pad_emb[130] = 1.0  # unknown
+                p_emb.append(pad_emb)
                 p_types.append(0)
                 p_ids.append(0)
 
@@ -561,6 +596,7 @@ def ai_podem(
     solver: Optional[HierarchicalReconvSolver] = None,
     verbose: bool = False,
     seed: Optional[int] = None,
+    no_fallback: bool = False,
 ) -> bool:
     """
     AI-Assisted PODEM with configurable modes.
@@ -672,8 +708,10 @@ def ai_podem(
             return True
 
     # --- Step 3: Global Fallback ---
-    # If we used AI Activation and failed, retry Clean
+    # If we used AI Activation and failed, retry Clean (unless no_fallback is set)
     if enable_ai_activation and not result:
+        if no_fallback:
+            return False
         if verbose:
             print("[AI-PODEM] AI-assisted attempts failed. Retrying CLEAN (Standard PODEM)...")
         reset_gates(circuit, total_gates)

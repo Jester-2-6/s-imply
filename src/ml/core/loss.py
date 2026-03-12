@@ -316,6 +316,82 @@ def calculate_full_logic_loss(
     return loss_per_sample.mean()
 
 
+def calculate_shared_node_consistency_loss(
+    node_ids: torch.Tensor,  # [B, P, L]
+    probs: torch.Tensor,  # [B, P, L, 2] Gumbel-Softmax one-hot
+    mask_valid: torch.Tensor,  # [B, P, L]
+) -> torch.Tensor:
+    """Cross-path shared-node consistency loss.
+
+    The model failure mode caught by this loss: the same circuit node appears on
+    multiple paths (shared stem / reconvergent fan-out) and the model predicts
+    *different* logic values for it on different paths.  This produces
+    self-contradictory assignments that the HierarchicalReconvSolver rejects.
+
+    For every node that appears on ≥2 valid path positions within the same
+    batch sample, we penalise the variance of P(node=1) across those positions
+    using MSE against the mean prediction, normalised by the number of shared
+    node appearances.
+
+    This is a differentiable surrogate: with Gumbel hard=True outputs, the
+    gradients flow through the Gumbel distribution and push the model to assign
+    consistent values to shared stems.
+    """
+    device = node_ids.device
+    B, P, L = node_ids.shape
+    probs_1 = probs[..., 1]  # [B, P, L]
+
+    total_loss = torch.tensor(0.0, device=device)
+    total_shared = 0
+
+    for b in range(B):
+        # Collect (node_id -> list of prob_1 values) for valid positions only
+        # We use a dict of lists, then vectorise the MSE per node.
+        nid_flat = node_ids[b].reshape(-1)          # [P*L]
+        p1_flat = probs_1[b].reshape(-1)             # [P*L]
+        vm_flat = mask_valid[b].reshape(-1)          # [P*L]
+        valid_nid = nid_flat[vm_flat & (nid_flat > 0)]
+        valid_p1 = p1_flat[vm_flat & (nid_flat > 0)]
+
+        if valid_nid.numel() == 0:
+            continue
+
+        # Find unique node IDs and their inverse mapping
+        unique_ids, inverse = torch.unique(valid_nid, return_inverse=True)
+        # Count occurrences of each unique node
+        counts = torch.zeros(unique_ids.shape[0], device=device, dtype=torch.long)
+        counts.scatter_add_(0, inverse, torch.ones_like(inverse))
+
+        # Only penalise nodes that appear on ≥2 paths
+        shared_mask = counts >= 2
+        if not shared_mask.any():
+            continue
+
+        # For each shared node, compute MSE(p1_values, mean(p1_values))
+        # Scatter-add to get sum of p1 per unique node
+        p1_sum = torch.zeros(unique_ids.shape[0], device=device, dtype=probs_1.dtype)
+        p1_sum.scatter_add_(0, inverse, valid_p1)
+        p1_mean_per_node = p1_sum / counts.float().clamp(min=1.0)  # [U]
+
+        # Expand mean back to each occurrence
+        mean_per_pos = p1_mean_per_node[inverse]  # [valid_count]
+        sq_diff = (valid_p1 - mean_per_pos) ** 2  # [valid_count]
+
+        # Mask to shared nodes only
+        shared_per_pos = shared_mask[inverse]
+        shared_sq_diff = sq_diff[shared_per_pos]
+        n_shared = shared_sq_diff.numel()
+
+        if n_shared > 0:
+            total_loss = total_loss + shared_sq_diff.sum() / n_shared
+            total_shared += 1
+
+    if total_shared == 0:
+        return torch.tensor(0.0, device=device)
+
+    return total_loss / total_shared
+
+
 def reinforce_loss(
     logits: torch.Tensor,
     gate_types: torch.Tensor,
@@ -331,6 +407,7 @@ def reinforce_loss(
     node_ids: Optional[torch.Tensor] = None,
     lambda_logic: float = 0.0,
     lambda_full_logic: float = 0.0,
+    lambda_shared_node: float = 1.0,
     soft_edge_lambda: float = 1.0,
     normalize_reward: bool = True,
     anchor_alpha: float = 0.1,
@@ -377,7 +454,8 @@ def reinforce_loss(
             )
             constraint_loss = c_loss * lambda_constraint
 
-            # Metric: Violation rate
+            # Metric: Violation rate — must be computed BEFORE forcing, so it
+            # reflects the model's actual (unforced) predictions.
             preds = actions[constraint_mask]
             targets = constraint_vals[constraint_mask]
             violations = (preds != targets).float().sum()
@@ -386,22 +464,25 @@ def reinforce_loss(
                 violations.item() / max(1, total_c), device=logits.device
             )
 
-            # Forcing: Update actions to match constraints to ensure downstream
-            # path consistency?
-            # In RL we could overwrite actions. In Gumbel matching loss is usually enough.
-            # But to help convergence we can overwrite the 'hard' actions for the
-            # forward pass context if we wanted. But Gumbel hard=True makes it discrete.
-            # Let's overwrite `actions` indices for metrics, but we can't easily
-            # overwrite `actions_one_hot` without breaking gradient flow unless we
-            # are careful.
-            # Since constraint_loss is strong, we'll assume it converges.
-            # However, existing code overwrote actions.
+            # Save per-sample violation info for reward penalty (before forcing overwrites actions).
+            # Scatter to get per-sample violated and total constrained counts.
+            _b_idx = torch.arange(B, device=logits.device)[:, None, None].expand_as(constraint_mask)
+            _flat_b = _b_idx[constraint_mask]
+            _flat_wrong = (actions[constraint_mask] != targets).float()
+            _n_violated = torch.zeros(B, device=logits.device)
+            _n_constrained = torch.zeros(B, device=logits.device)
+            _n_violated.scatter_add_(0, _flat_b, _flat_wrong)
+            _n_constrained.scatter_add_(0, _flat_b, torch.ones_like(_flat_wrong))
+
+            # Forcing: overwrite actions to match constraints for downstream metric
+            # consistency (edge_ok checks etc. will see the forced values).
             actions[constraint_mask] = constraint_vals[constraint_mask]
 
     # Solvability Loss
     solvability_loss = torch.tensor(0.0, device=logits.device)
     if solvability_logits is not None and solvability_labels is not None:
-        weights = torch.tensor([10.0, 1.0], device=logits.device)
+        # Class 0 = SAT, Class 1 = UNSAT. Upweight UNSAT (rare/hard class).
+        weights = torch.tensor([1.0, 10.0], device=logits.device)
         solvability_loss = (
             F.cross_entropy(solvability_logits, solvability_labels, weight=weights)
             * lambda_solvability
@@ -499,6 +580,16 @@ def reinforce_loss(
         reward = sat_base_reward.clone()
         # Incorporate solvability prediction reward signal
         reward = reward + unsat_reward
+
+        # Penalise constraint violations: each violated constrained node costs 1 reward point.
+        # Without this, a model that predicts all-1 gets max reward=1.5 regardless of
+        # how many constraint positions it gets wrong, making RL fine-tuning a no-op.
+        # _n_violated / _n_constrained were computed above, BEFORE actions was forced,
+        # so they reflect the model's actual (unforced) predictions.
+        if constraint_mask is not None and constraint_vals is not None and constraint_mask.any():
+            c_penalty = -(_n_violated / _n_constrained.clamp(min=1.0))
+            reward = reward + c_penalty
+
         avg_reward = reward.mean()
 
     # -----------------------------------------------------------------------
@@ -609,6 +700,19 @@ def reinforce_loss(
             device=logits.device,
         )
         loss_terms.append(lambda_full_logic * full_logic_loss)
+
+    # 8. Cross-Path Shared-Node Consistency Loss
+    # Penalises the model for predicting different values for the same circuit
+    # node when it appears on multiple paths (shared stem).  This is the root
+    # cause of the c432/gate-428 failure: the model predicted contradictory
+    # values for intermediate NAND gates that appear on several paths.
+    if lambda_shared_node > 0.0 and node_ids is not None:
+        shared_node_loss = calculate_shared_node_consistency_loss(
+            node_ids=node_ids,
+            probs=actions_one_hot,
+            mask_valid=mask_valid,
+        )
+        loss_terms.append(lambda_shared_node * shared_node_loss)
 
     # Sum all loss terms
     if loss_terms:

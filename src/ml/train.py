@@ -54,13 +54,13 @@ warnings.filterwarnings("ignore", message="The PyTorch API of nested tensors is 
 def _curriculum_constraint_prob(epoch: int, total_epochs: int) -> float:
     """Return constraint probability for curriculum training.
 
-    Phase 1 (first 25% epochs): 0%
-    Phase 2 (remaining 75%): fixed 0.8
+    Phase 1 (first 10% epochs): 0%
+    Phase 2 (remaining 90%): fixed 0.8
     """
     if total_epochs <= 0:
         return 0.0
 
-    free_epochs = max(1, total_epochs // 4)
+    free_epochs = max(1, total_epochs // 10)
     if epoch <= free_epochs:
         return 0.0
 
@@ -234,9 +234,18 @@ class TrainConfig:
     max_paths: int = 200
     pretrained: Optional[str] = None
 
+    # Solvability head loss weight. Set to 0.0 to disable when UNSAT labels are absent.
+    lambda_solvability: float = 1.0
+
     # Constraint loss weight — increase (e.g. 5.0) to force the model to honour
     # constraints even when they conflict with the soft-edge gate-logic loss.
     lambda_constraint: float = 1.0
+
+    # Cross-path shared-node consistency loss weight.
+    # Penalises contradictory predictions for the same circuit node across paths.
+    # Addresses the failure mode where a shared stem (e.g. a NAND gate on 3
+    # paths) gets different predicted values on different paths.
+    lambda_shared_node: float = 1.0
 
     # CUDA OOM recovery: exponential backoff retry settings.
     oom_max_retries: int = 3   # number of retry attempts before skipping a batch
@@ -473,7 +482,7 @@ def train_one_epoch(
     )
 
     if cfg.verbose:
-        free_epochs_disp = max(1, cfg.epochs // 4)
+        free_epochs_disp = max(1, cfg.epochs // 10)
         print(
             f"[curriculum] epoch={epoch} constraint_prob={constraint_prob:.3f} "
             f"(Phase {'1' if epoch <= free_epochs_disp else '2'})"
@@ -485,6 +494,7 @@ def train_one_epoch(
     gumbel_t = max(0.1, cfg.gumbel_temp * (cfg.gumbel_anneal_rate ** (epoch - 1)))
 
     pbar = tqdm(loader, desc=f"Epoch {epoch}", total=target_batches, unit="batch")
+    pbar.set_postfix({"c_prob": f"{constraint_prob:.0%}"})
 
     for batch_idx, batch in enumerate(pbar):
         paths = batch["paths_emb"].to(device, non_blocking=True)
@@ -656,6 +666,8 @@ def train_one_epoch(
                         anchor_alpha=cfg.anchor_reward_alpha,
                         gumbel_temp=gumbel_t,
                         lambda_constraint=cfg.lambda_constraint,
+                        lambda_shared_node=cfg.lambda_shared_node,
+                        lambda_solvability=cfg.lambda_solvability,
                     )
 
                 # NaN/Inf guard: skip corrupt batches
@@ -739,6 +751,7 @@ def train_one_epoch(
             )
             pbar.set_postfix(
                 {
+                    "c_prob": f"{constraint_prob:.0%}",
                     "loss": f"{total_loss / max(1, total_batches):.4f}",
                     "path_acc": f"{total_valid / max(1, total_batches):.4f}",
                     "solv": f"{dbg['solvability_acc']:.3f}",
@@ -897,6 +910,8 @@ def evaluate(
                 anchor_alpha=cfg.anchor_reward_alpha,
                 gumbel_temp=0.1,
                 lambda_constraint=cfg.lambda_constraint,
+                lambda_shared_node=cfg.lambda_shared_node,
+                lambda_solvability=cfg.lambda_solvability,
             )
 
         loss_val = loss.mean()
@@ -1015,7 +1030,9 @@ def cmd_train(args: argparse.Namespace) -> None:
         max_paths=getattr(args, "max_paths", 200),
         inject_constraints=getattr(args, "inject_constraints", False),
         pretrained=getattr(args, "pretrained", None),
+        lambda_solvability=getattr(args, "lambda_solvability", 1.0),
         lambda_constraint=getattr(args, "lambda_constraint", 1.0),
+        lambda_shared_node=getattr(args, "lambda_shared_node", 1.0),
         oom_max_retries=getattr(args, "oom_max_retries", 3),
         oom_base_wait=getattr(args, "oom_base_wait", 2.0),
         resume=getattr(args, "resume", False),
@@ -1499,12 +1516,32 @@ def build_argparser() -> argparse.ArgumentParser:
         help="Maximum number of paths per sample (truncation) to prevent OOM.",
     )
     t.add_argument(
+        "--lambda-solvability",
+        type=float,
+        default=1.0,
+        help=(
+            "Weight for solvability head CE loss. Set to 0.0 when the dataset "
+            "has no UNSAT samples to avoid the head overfitting to always-SAT."
+        ),
+    )
+    t.add_argument(
         "--lambda-constraint",
         type=float,
         default=1.0,
         help=(
             "Weight for constraint CE loss term. Increase to 3–5 when c_viol "
             "is stuck: the constraint signal must outweigh the soft-edge gate-logic loss."
+        ),
+    )
+    t.add_argument(
+        "--lambda-shared-node",
+        type=float,
+        default=1.0,
+        help=(
+            "Weight for cross-path shared-node consistency loss. Penalises the model "
+            "for predicting different values for the same circuit node across paths "
+            "(shared stem contradiction). Increase to 2–5 when the solver frequently "
+            "rejects model predictions due to cross-path logic violations."
         ),
     )
     t.add_argument(

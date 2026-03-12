@@ -4,7 +4,7 @@ Benchmark: Classic PODEM vs AI-PODEM on a single fault.
 Each run parses a fresh copy of the circuit to avoid state pollution across repeats.
 
 Usage:
-    conda run -n deepgate python -m scripts.benchmark_podem \\
+    python -m scripts.benchmark_podem \\
         --bench data/bench/ISCAS85/c432.bench \\
         --model checkpoints/reconv_max_occupancy/best_model.pth \\
         --gate 259 --sa 1 --repeats 3
@@ -69,6 +69,7 @@ def run_ai_podem(
     circuit_path: str,
     device: str,
     model_path: str,
+    pre_loaded_model=None,
 ) -> tuple[bool, float, int]:
     """AI-PODEM (AI activation, classic PODEM propagation) on a fresh circuit, timed, silent."""
     circuit, total_gates = _fresh_circuit(bench_path)
@@ -81,7 +82,7 @@ def run_ai_podem(
     )
 
     with _silence():
-        predictor = ModelPairPredictor(circuit, circuit_path, config)
+        predictor = ModelPairPredictor(circuit, circuit_path, config, pre_loaded_model=pre_loaded_model)
     solver = HierarchicalReconvSolver(circuit, predictor, verbose=False)
     reset_statistics()
 
@@ -96,9 +97,13 @@ def run_ai_podem(
             enable_ai_activation=True,
             enable_ai_propagation=False,
             verbose=False,
+            no_fallback=True,
         )
     elapsed = time.perf_counter() - t0
     stats = get_statistics()
+    if not result:
+        print(f"\n[AI-PODEM] FAILED: AI could not solve fault (gate={fault.gate_id}, val={fault.value}). No fallback.")
+        sys.exit(1)
     return bool(result), elapsed, stats["backtrack_count"]
 
 
@@ -135,6 +140,21 @@ def main():
     print()
 
     # ------------------------------------------------------------------ #
+    #  Pre-load model once — avoids redundant torch.load + embedding
+    #  extraction on every repeat.
+    # ------------------------------------------------------------------ #
+    from src.atpg.ai_podem import ModelPairPredictor as _MPP, AiPodemConfig as _Cfg
+
+    print("Loading model...", end=" ", flush=True)
+    _t_load = time.perf_counter()
+    _cfg_probe = _Cfg(model_path=args.model, device=device)
+    _probe_circuit, _ = _fresh_circuit(args.bench)
+    with _silence():
+        _probe_predictor = _MPP(_probe_circuit, args.bench, _cfg_probe)
+    pre_loaded_model = _probe_predictor.model
+    print(f"done ({time.perf_counter() - _t_load:.2f}s)")
+
+    # ------------------------------------------------------------------ #
     #  Timed runs  (each run gets a fresh circuit to eliminate state bugs)
     # ------------------------------------------------------------------ #
     classic_times: list[float] = []
@@ -150,7 +170,7 @@ def main():
         classic_ok.append(ok_c)
         classic_bt.append(bt_c)
 
-        ok_a, t_a, bt_a = run_ai_podem(args.bench, fault, args.bench, device, args.model)
+        ok_a, t_a, bt_a = run_ai_podem(args.bench, fault, args.bench, device, args.model, pre_loaded_model=pre_loaded_model)
         ai_times.append(t_a)
         ai_ok.append(ok_a)
         ai_bt.append(bt_a)
