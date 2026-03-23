@@ -18,6 +18,36 @@ from src.atpg.reconv_podem import PathConsistencySolver
 from src.util.struct import Gate, GateType, LogicValue
 
 
+def _logic_value_label(value: LogicValue | int) -> str:
+    mapping = {
+        LogicValue.ZERO: "0",
+        LogicValue.ONE: "1",
+        LogicValue.XD: "X",
+        LogicValue.D: "D",
+        LogicValue.DB: "DB",
+    }
+    try:
+        return mapping[LogicValue(value)]
+    except Exception:
+        return str(value)
+
+
+def _format_assignment(assignment: Dict[int, LogicValue], limit: int = 20) -> str:
+    if not assignment:
+        return "{}"
+
+    items = sorted(assignment.items())
+    rendered = [f"{node}={_logic_value_label(value)}" for node, value in items[:limit]]
+    if len(items) > limit:
+        rendered.append(f"... +{len(items) - limit} more")
+    return "{" + ", ".join(rendered) + "}"
+
+
+def _format_pair(pair: Dict[str, Any]) -> str:
+    paths = " | ".join("->".join(str(node) for node in path) for path in pair["paths"])
+    return f"start={pair['start']} reconv={pair['reconv']} paths=[{paths}]"
+
+
 class ReconvPairPredictor(abc.ABC):
     """Abstract base class for predicting solutions to reconvergent pairs."""
 
@@ -121,7 +151,10 @@ class HierarchicalReconvSolver:
         pairs_by_reconv = self.pair_cache[target_node]
 
         if self.verbose:
-            print("[Solver] Collected reconvergent pairs")
+            print(
+                f"[Solver] Collected {sum(len(v) for v in pairs_by_reconv.values())} "
+                f"reconvergent pairs"
+            )
 
         # Initial constraints: target + provided constraints
         initial_constraints = {}
@@ -134,6 +167,8 @@ class HierarchicalReconvSolver:
         initial_constraints[target_node] = (
             LogicValue(target_val) if isinstance(target_val, int) else target_val
         )
+        if self.verbose:
+            print(f"[Solver] Initial assignment: {_format_assignment(initial_constraints)}")
 
         # 3. Recursive Solve
         queue = [target_node]
@@ -327,6 +362,11 @@ class HierarchicalReconvSolver:
             unsolved_pairs = [p for p in pairs_by_reconv[gate] if id(p) not in solved_pairs]
 
         if unsolved_pairs:
+            if self.verbose:
+                print(
+                    f"[Solver] Gate {gate} has {len(unsolved_pairs)} unsolved pair(s), "
+                    f"current assignment {_format_assignment(assignment)}"
+                )
             # Suspend normal backtrace, try AI model on all available unsolved pairs
             for pair in unsolved_pairs:
                 if (
@@ -335,6 +375,11 @@ class HierarchicalReconvSolver:
                 ):
                     return None
                 self.inferences += 1
+                if self.verbose:
+                    print(
+                        f"[Solver] Querying predictor for {_format_pair(pair)} with "
+                        f"assignment {_format_assignment(assignment)}"
+                    )
                 prediction_result = self.predictor.predict(pair, assignment, seed=seed)
                 inputs_snapshot = None
                 if isinstance(prediction_result, tuple):
@@ -343,11 +388,24 @@ class HierarchicalReconvSolver:
                     candidates = prediction_result
 
                 if not candidates:
+                    if self.verbose:
+                        print(f"[Solver] Predictor returned no candidates for {_format_pair(pair)}")
                     continue
+
+                if self.verbose:
+                    print(
+                        f"[Solver] Predictor returned {len(candidates)} candidate(s) for "
+                        f"{_format_pair(pair)}"
+                    )
 
                 for i, assignment_part in enumerate(candidates):
                     if self.nodes_visited >= self.nodes_visited_limit:
                         return None
+                    if self.verbose:
+                        print(
+                            f"[Solver] Trying candidate {i + 1}/{len(candidates)}: "
+                            f"{_format_assignment(assignment_part)}"
+                        )
                     step_record = None
                     if self.recorder and inputs_snapshot:
                         step_record = self.recorder.log_step(
@@ -364,6 +422,11 @@ class HierarchicalReconvSolver:
                     for k, v in assignment_part.items():
                         if not self._check_global_consistency(k, v, new_assignment):
                             conflict = True
+                            if self.verbose:
+                                print(
+                                    f"[Solver] Rejecting candidate due to global conflict at "
+                                    f"gate {k}={_logic_value_label(v)}"
+                                )
                             break
                         new_assignment[k] = v
 
@@ -382,6 +445,12 @@ class HierarchicalReconvSolver:
                             comp_val = self._compute_gate_robust(gate_obj.type, input_vals)
                             if comp_val != LogicValue.XD and comp_val != new_assignment[k]:
                                 conflict = True
+                                if self.verbose:
+                                    print(
+                                        f"[Solver] Rejecting candidate due to logic mismatch at "
+                                        f"gate {k}: expected {_logic_value_label(comp_val)}, "
+                                        f"got {_logic_value_label(new_assignment[k])}"
+                                    )
                                 break
                         for fout in gate_obj.fot:
                             if fout in new_assignment:
@@ -392,6 +461,12 @@ class HierarchicalReconvSolver:
                                 comp_val = self._compute_gate_robust(fout_obj.type, input_vals)
                                 if comp_val != LogicValue.XD and comp_val != new_assignment[fout]:
                                     conflict = True
+                                    if self.verbose:
+                                        print(
+                                            f"[Solver] Rejecting candidate due to fanout mismatch "
+                                            f"at gate {fout}: expected {_logic_value_label(comp_val)}, "
+                                            f"got {_logic_value_label(new_assignment[fout])}"
+                                        )
                                     break
                         if conflict:
                             break
@@ -410,11 +485,28 @@ class HierarchicalReconvSolver:
                     new_solved = set(solved_pairs)
                     new_solved.add(id(pair))
 
+                    if self.verbose:
+                        print(
+                            f"[Solver] Candidate accepted provisionally. Next queue={new_queue}, "
+                            f"assignment={_format_assignment(new_assignment)}"
+                        )
+
                     result = self._backward_justify(
                         new_queue, new_assignment, new_solved, pairs_by_reconv, seed
                     )
                     if result is not None:
+                        if self.verbose:
+                            print(
+                                f"[Solver] Candidate led to solution: "
+                                f"{_format_assignment(result)}"
+                            )
                         return result
+
+                    if self.verbose:
+                        print(
+                            f"[Solver] Candidate backtracked: "
+                            f"{_format_assignment(assignment_part)}"
+                        )
 
                     if step_record and self.recorder:
                         self.recorder.mark_backtrack(penalty=-0.5)

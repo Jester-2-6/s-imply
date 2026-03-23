@@ -21,10 +21,46 @@ from src.ml.data.embedding import EmbeddingExtractor
 from src.util.struct import Fault, Gate, GateType, LogicValue
 
 
+def _logic_value_label(value: LogicValue | int) -> str:
+    mapping = {
+        LogicValue.ZERO: "0",
+        LogicValue.ONE: "1",
+        LogicValue.XD: "X",
+        LogicValue.D: "D",
+        LogicValue.DB: "DB",
+    }
+    try:
+        return mapping[LogicValue(value)]
+    except Exception:
+        return str(value)
+
+
+def _format_assignment(assignment: Dict[int, LogicValue], limit: int = 20) -> str:
+    if not assignment:
+        return "{}"
+
+    items = sorted(assignment.items())
+    rendered = [f"{node}={_logic_value_label(value)}" for node, value in items[:limit]]
+    if len(items) > limit:
+        rendered.append(f"... +{len(items) - limit} more")
+    return "{" + ", ".join(rendered) + "}"
+
+
+def _format_paths(paths: List[List[int]]) -> str:
+    return " | ".join("->".join(str(node) for node in path) for path in paths)
+
+
+def _format_pair(pair_info: Dict[str, Any]) -> str:
+    return (
+        f"start={pair_info['start']} reconv={pair_info['reconv']} "
+        f"paths=[{_format_paths(pair_info['paths'])}]"
+    )
+
+
 @dataclass
 class AiPodemConfig:
     model_path: str
-    device: str = "cpu"
+    device: str = "cuda"
     enable_ai_activation: bool = True
     enable_ai_propagation: bool = True
     verbose: bool = False
@@ -281,11 +317,26 @@ class ModelPairPredictor(ReconvPairPredictor):
             self.prediction_cache.clear()
 
         if cache_key in self.prediction_cache:
+            if self.config.verbose:
+                cached_candidates, _ = self.prediction_cache[cache_key]
+                print(
+                    "[AI-MODEL] Cache hit for "
+                    f"{_format_pair(pair_info)} with constraints "
+                    f"{_format_assignment(dict(relevant_constraints))}"
+                )
+                print(
+                    f"[AI-MODEL] Cached candidates: "
+                    f"{[_format_assignment(candidate) for candidate in cached_candidates]}"
+                )
             return self.prediction_cache[cache_key]
 
         if self.struct_emb is None or self.model is None:
             # Fallback to pure solver if model failed
             res = self._fallback_solve(pair_info, constraints)[0], None
+            if self.config.verbose:
+                print(
+                    f"[AI-MODEL] Model unavailable, using fallback for {_format_pair(pair_info)}"
+                )
             self.prediction_cache[cache_key] = res
             return res
 
@@ -310,6 +361,11 @@ class ModelPairPredictor(ReconvPairPredictor):
             # All gates already have values - skip model, return existing values
             # Need strict type match for return tuple
             res = [precomputed_assignment], None
+            if self.config.verbose:
+                print(
+                    f"[AI-MODEL] Skipping inference for {_format_pair(pair_info)} because all "
+                    f"path nodes are constrained: {_format_assignment(precomputed_assignment)}"
+                )
             self.prediction_cache[cache_key] = res
             return res
 
@@ -401,6 +457,20 @@ class ModelPairPredictor(ReconvPairPredictor):
             "files": [self.circuit_path],
         }
 
+        if self.config.verbose:
+            print(f"[AI-MODEL] Query: {_format_pair(pair_info)}")
+            print(
+                "[AI-MODEL] Relevant constraints: "
+                f"{_format_assignment(dict(relevant_constraints))}"
+            )
+            print(
+                "[AI-MODEL] Tensor shapes: "
+                f"emb={tuple(batch_embs.shape)} mask={tuple(batch_mask.shape)} "
+                f"types={tuple(batch_types.shape)}"
+            )
+            if seed is not None:
+                print(f"[AI-MODEL] Seed: {seed}")
+
         # 2. Run Inference
         with torch.no_grad():
             # Inject noise if seed is provided. Scale could be configurable.
@@ -418,6 +488,7 @@ class ModelPairPredictor(ReconvPairPredictor):
         # Output is strictly binary (0 or 1) logits [B, P, L, 2]
         probs = torch.softmax(logits, dim=-1)  # [1, P, L, 2]
         vals = torch.argmax(probs, dim=-1).squeeze(0)  # [P, L] -> 0 or 1
+        solv_probs = torch.softmax(solv_logits, dim=-1).squeeze(0)
 
         # 4. Post-process: enforce NOT/BUFF deterministic gate rules
         # (This remains valid for 0/1 predictions)
@@ -465,6 +536,19 @@ class ModelPairPredictor(ReconvPairPredictor):
             inputs_snapshot,
             bench_file=self.circuit_path,
         )
+        if self.config.verbose:
+            candidates, _ = res
+            print(
+                "[AI-MODEL] Solvability probs: "
+                f"{[round(float(prob), 4) for prob in solv_probs.tolist()]}"
+            )
+            print(
+                f"[AI-MODEL] Raw prediction: {_format_assignment(predicted_assignment)}"
+            )
+            print(
+                f"[AI-MODEL] Ranked candidates: "
+                f"{[_format_assignment(candidate) for candidate in candidates]}"
+            )
         self.prediction_cache[cache_key] = res
         return res
 
@@ -479,6 +563,11 @@ class ModelPairPredictor(ReconvPairPredictor):
         bench_file="",
     ):
         violations = self._verify_assignment_logic(predicted_assignment, constraints)
+        if self.config.verbose:
+            print(
+                f"[AI-MODEL] Logic verification for {_format_pair(pair_info)}: "
+                f"violations={violations}"
+            )
 
         # Always return model prediction as first candidate.
         # The HierarchicalReconvSolver._solve_recursive does its own
@@ -489,6 +578,11 @@ class ModelPairPredictor(ReconvPairPredictor):
         if violations > 0:
             fallback, _ = self._fallback_solve(pair_info, constraints)
             candidates.extend(fallback)
+            if self.config.verbose:
+                print(
+                    f"[AI-MODEL] Added {len(fallback)} fallback candidates for "
+                    f"{_format_pair(pair_info)}"
+                )
 
         return candidates[:10], inputs_snapshot
 
@@ -578,9 +672,18 @@ class ModelPairPredictor(ReconvPairPredictor):
 
         candidates = []
         for t in targets:
+            if self.config.verbose:
+                print(
+                    f"[AI-MODEL] Fallback solve for {_format_pair(pair_info)} with "
+                    f"reconv target {_logic_value_label(t)}"
+                )
             res = self.solver.solve(pair_info, t, constraints)
             if res:
                 candidates.append(res)
+                if self.config.verbose:
+                    print(
+                        f"[AI-MODEL] Fallback candidate: {_format_assignment(res)}"
+                    )
         return candidates, snapshot
 
 

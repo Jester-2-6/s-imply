@@ -7,6 +7,7 @@ and prepares them for training the Multi-Path transformer model.
 
 from __future__ import annotations
 
+import gc
 import glob
 import json
 import os
@@ -244,6 +245,20 @@ class ReconvergentPathsDataset(Dataset):
         circuit, _ = parse_bench_file(bench_file)
         return circuit
 
+    @staticmethod
+    @lru_cache(maxsize=64)
+    def _load_circuit_emb_cached(emb_path: str):
+        """Load per-circuit embedding cache produced by build_fault_dataset.py.
+
+        Returns (struct_emb Tensor, gate_mapping dict) or (None, {}) on failure.
+        """
+        try:
+            data = torch.load(emb_path, map_location="cpu", weights_only=True)
+            return data["struct_emb"], data["gate_mapping"]
+        except Exception as e:
+            print(f"[Dataset WARN] Failed to load circuit emb {emb_path}: {e}")
+            return None, {}
+
     def _load_shard_metadata(self, shard_paths: List[str]):
         """Read metadata from shards without loading tensors."""
         self._shard_files = shard_paths
@@ -436,9 +451,20 @@ class ReconvergentPathsDataset(Dataset):
             file_path = entry["file"]
             info = entry["info"]
             final_info = info
-            has_embeddings = "struct_emb" in entry and "gate_mapping" in entry
-            struct_emb = entry.get("struct_emb")
-            gate_mapping_int = entry.get("_gate_mapping_int", {})
+
+            # New format: embeddings stored per-circuit in a separate .pt file.
+            # Old format: struct_emb tensor embedded inline in each sample dict.
+            is_new_format = "circuit_emb" in entry and "circuit_emb" not in ("",)
+            if is_new_format:
+                struct_emb, gate_mapping_int = self._load_circuit_emb_cached(
+                    entry["circuit_emb"]
+                )
+                has_embeddings = struct_emb is not None
+            else:
+                has_embeddings = "struct_emb" in entry and "gate_mapping" in entry
+                struct_emb = entry.get("struct_emb")
+                gate_mapping_int = entry.get("_gate_mapping_int", {})
+
             paths = info["paths"]
             P = len(paths)
             D = struct_emb.shape[1] if (has_embeddings and struct_emb is not None) else 128
@@ -487,29 +513,53 @@ class ReconvergentPathsDataset(Dataset):
             )
             paths_emb[p_sel, l_sel, D - 3 : D] = onehot
 
-        # Step 4: Use pre-baked constraints (from shard) or empty tensors
-        # Constraints are now generated during preprocess_to_shards,
-        # not on-the-fly. This eliminates the GIL-locked solver bottleneck.
+        # Step 4: Build constraint tensors.
+        # New-format datasets (build_fault_dataset.py) carry pre-computed circuit-consistent
+        # constraints in entry["constraints"] and entry["labels"].  Old-format datasets fall
+        # back to the legacy on-the-fly random-simulation path (inject_constraints flag).
+        c_mask_tensor = torch.zeros_like(node_ids, dtype=torch.bool, device=self.device)
+        c_vals_tensor = torch.zeros_like(node_ids, dtype=torch.long, device=self.device)
+
         if not getattr(self, "_use_processed", False):
-            # Slow path (pickle): generate on-the-fly as fallback
-            c_mask_tensor = torch.zeros_like(node_ids, dtype=torch.bool, device=self.device)
-            c_vals_tensor = torch.zeros_like(node_ids, dtype=torch.long, device=self.device)
-            if self.inject_constraints and self.add_logic_value and final_info:
+            entry_constraints: Optional[Dict[str, Any]] = None
+            if hasattr(self, "data") and idx < len(self.data):
+                entry_constraints = self.data[idx].get("constraints")
+
+            if entry_constraints is not None:
+                # New format: circuit-consistent constraints baked by build_fault_dataset.py
+                D = paths_emb.shape[-1]
+                for nid, val in entry_constraints.items():
+                    mask = node_ids == nid
+                    if not mask.any():
+                        continue
+                    c_mask_tensor |= mask
+                    c_vals_tensor[mask] = int(val)
+                    if self.add_logic_value and D >= 3:
+                        vec = torch.tensor(
+                            [1.0, 0.0, 0.0] if val == 0 else [0.0, 1.0, 0.0],
+                            device=self.device,
+                            dtype=paths_emb.dtype,
+                        )
+                        paths_emb.view(-1, D)[mask.view(-1), D - 3 : D] = vec
+            elif self.inject_constraints and self.add_logic_value and final_info:
+                # Legacy fallback: random-simulation constraints (old-format datasets)
                 constraints = self._gen_constraints_for_sample(final_info, file_path)
                 if constraints:
+                    D = paths_emb.shape[-1]
                     for nid, val in constraints.items():
                         mask = node_ids == nid
-                        if mask.any():
-                            c_mask_tensor |= mask
-                            c_vals_tensor[mask] = int(val)
-                            D = paths_emb.shape[-1]
+                        if not mask.any():
+                            continue
+                        c_mask_tensor |= mask
+                        c_vals_tensor[mask] = int(val)
+                        if D >= 3:
                             vec = torch.tensor(
                                 [1.0, 0.0, 0.0] if val == 0 else [0.0, 1.0, 0.0],
                                 device=self.device,
+                                dtype=paths_emb.dtype,
                             )
-                            pe_flat = paths_emb.view(-1, D)
-                            pe_flat[mask.view(-1), D - 3 : D] = vec
-        # else: c_mask_tensor / c_vals_tensor already loaded from shard
+                            paths_emb.view(-1, D)[mask.view(-1), D - 3 : D] = vec
+        # else: c_mask_tensor / c_vals_tensor already loaded from shard above
 
         # Step 5: Finalize dictionary
         res = {
@@ -522,10 +572,9 @@ class ReconvergentPathsDataset(Dataset):
             "anchor_l": torch.tensor(l_sel, dtype=torch.long, device=self.device),
             "anchor_v": torch.tensor(v_sel, dtype=torch.long, device=self.device),
             "solvability": torch.tensor(s_sel, dtype=torch.long, device=self.device),
+            "constraint_mask": c_mask_tensor,
+            "constraint_vals": c_vals_tensor,
         }
-        if self.inject_constraints:
-            res["constraint_mask"] = c_mask_tensor
-            res["constraint_vals"] = c_vals_tensor
         return res
 
     def get_shard_batch(self, indices: List[int]) -> Dict[str, Any]:
@@ -584,9 +633,12 @@ class ReconvergentPathsDataset(Dataset):
             out["anchor_v"] = data["anchor_v"][local_idxs].clone()
             out["solvability"] = data["solvability"][local_idxs].clone()
 
-        if self.inject_constraints and "constraint_mask" in data:
+        if "constraint_mask" in data:
             out["constraint_mask"] = data["constraint_mask"][local_idxs].clone()
             out["constraint_vals"] = data["constraint_vals"][local_idxs].clone()
+        else:
+            out["constraint_mask"] = torch.zeros_like(node_ids, dtype=torch.bool)
+            out["constraint_vals"] = torch.zeros_like(node_ids, dtype=torch.long)
 
         return out
 
@@ -725,28 +777,56 @@ class ReconvergentPathsDataset(Dataset):
         input_dataset_path: str,
         output_dir: str,
         max_path_length: int = 50,
-        shard_size: int = 5000,
+        shard_size: int = 50000,
         dtype: torch.dtype = torch.float16,
         device: torch.device = torch.device("cpu"),
+        resume: bool = False,
     ) -> None:
         """Precompute per-sample tensors and save to shard files for fast training.
 
-        This will read the pickle dataset (with struct_emb + gate_mapping), build
-        paths_emb/attn_mask/node_ids for each sample (padded to max_path_length),
-        and write them in shards to output_dir as shard_XXXXX.pt files.
+        ``input_dataset_path`` can be either:
+        - A single ``.pkl`` file (original behaviour).
+        - A directory containing ``chunk_XXXXX.pkl`` files written by
+          ``build_fault_dataset.py`` in chunk-directory mode.  Each chunk is
+          loaded and released individually to avoid OOM on large benchmark sets.
+
+        Outputs ``shard_XXXXX.pt`` files in ``output_dir``.
+
+        If ``resume=True``, skips chunks already recorded in ``progress.json``
+        and continues shard numbering from where the previous run left off.
         """
         os.makedirs(output_dir, exist_ok=True)
 
-        # Use the same mapping logic via a temporary dataset instance (raw mode)
-        raw_ds = ReconvergentPathsDataset(
-            input_dataset_path,
-            device=device,
-            max_path_length=max_path_length,
-            load_processed=False,
-        )
+        # Resolve input: single pkl or directory of chunk pkls
+        if os.path.isdir(input_dataset_path):
+            chunk_paths = sorted(
+                os.path.join(input_dataset_path, f)
+                for f in os.listdir(input_dataset_path)
+                if f.startswith("chunk_") and f.endswith(".pkl")
+            )
+            if not chunk_paths:
+                raise FileNotFoundError(
+                    f"No chunk_*.pkl files found in {input_dataset_path}"
+                )
+            print(f"Chunk-directory mode: {len(chunk_paths)} chunk(s) → {output_dir}")
+        else:
+            chunk_paths = [input_dataset_path]
 
-        total = len(raw_ds)
+        # Resume: load progress state
+        progress_path = os.path.join(output_dir, "progress.json")
+        done_chunks: set = set()
+        total = 0
         shard_idx = 0
+        if resume and os.path.exists(progress_path):
+            with open(progress_path) as _pf:
+                _prog = json.load(_pf)
+            done_chunks = set(_prog.get("done_chunks", []))
+            total = _prog.get("total_samples", 0)
+            shard_idx = _prog.get("next_shard_idx", 0)
+            print(
+                f"Resuming: {len(done_chunks)} chunks done, "
+                f"{total:,} samples, next shard={shard_idx}"
+            )
 
         buf_paths: List[torch.Tensor] = []
         buf_masks: List[torch.Tensor] = []
@@ -804,121 +884,254 @@ class ReconvergentPathsDataset(Dataset):
                 "constraint_vals": cvals_t.cpu(),
             }
             out_path = os.path.join(output_dir, f"shard_{shard_idx:05d}.pt")
-            torch.save(shard, out_path)
-            print(f"Wrote {out_path} ({paths_t.shape[0]} samples)")
+            tmp_path = out_path + ".tmp"
+            torch.save(shard, tmp_path)
+            os.replace(tmp_path, out_path)  # atomic rename — no partial shards on crash
+            tqdm.write(f"Wrote {out_path} ({paths_t.shape[0]} samples)")
             shard_idx += 1
             buf_paths, buf_masks, buf_nodes, buf_files = [], [], [], []
             buf_ap, buf_al, buf_av, buf_solv = [], [], [], []
             buf_gt = []
             buf_cmask, buf_cvals = [], []
 
-        for i in range(total):
-            raw_ds.data[i]  # Access raw data to avoid overhead of __getitem__ logic
-            # But we need the embeddings which __getitem__ prepares...
-            # Actually __getitem__ of raw_ds (load_processed=False) does standard
-            # loading.
-            # Let's use raw_ds[i] but disable anchor generation in it
-            # to avoid double work?
-            # We want to force anchor generation here.
-            # So, set raw_ds.anchor_in_dataset = False temporarily,
-            # and call _gen_anchor manually.
+        # Iterate over chunks.  For a single-pkl input chunk_paths has one entry
+        # and raw_ds is built once.  For a chunk directory, one raw_ds is built
+        # per chunk and released before the next, keeping peak RAM low.
+        chunk_pbar = tqdm(chunk_paths, desc="Chunks", unit="chunk", position=0)
+        sample_pbar = tqdm(desc="Samples", unit="smp", position=1, leave=True)
 
-            # Access raw dict directly for speed if possible,
-            # but we need tensor padding logic.
-            # It's cleaner to reuse __getitem__ but handling anchors is tricky
-            # if we want to save them.
-            # Let's assume we call _gen_anchor_for_sample here manually.
+        for chunk_path in chunk_pbar:
+            chunk_pbar.set_postfix_str(os.path.basename(chunk_path))
+            if chunk_path in done_chunks:
+                tqdm.write(f"Skipping (already done): {os.path.basename(chunk_path)}")
+                continue
 
-            # Load basic tensors
-            # We can't use raw_ds[i] accurately if we want efficient access
-            # to underlying structures without overhead.
-            # Replicating logic from lines 418-440:
+            # Memory guard: abort before loading if available RAM is too low.
+            # Loading a 1GB pickle can require 3-5× its size in RAM.
+            try:
+                import psutil as _psutil
 
-            # Recalculate what we need
-            entry = raw_ds.data[i]
-            file_path = entry["file"]
-            info = entry["info"]
+                _avail_gb = _psutil.virtual_memory().available / 1024**3
+                _chunk_gb = os.path.getsize(chunk_path) / 1024**3
+                _needed_gb = _chunk_gb * 5  # conservative multiplier
+                if _avail_gb < _needed_gb + 2:  # +2 GB headroom
+                    tqdm.write(
+                        f"[ABORT] Not enough RAM for {os.path.basename(chunk_path)} "
+                        f"({_chunk_gb:.1f} GB on disk, need ~{_needed_gb:.1f} GB, "
+                        f"have {_avail_gb:.1f} GB available). "
+                        f"Progress saved — rerun with --resume."
+                    )
+                    # Flush any buffered samples before aborting
+                    flush()
+                    break
+            except ImportError:
+                pass  # psutil not available; skip check
 
-            # Use raw_ds helper to get Tensors
-            sample = raw_ds[i]  # This handles padding/embedding and gate types
-            pe = sample["paths_emb"].to(torch.float32).cpu()
-            am = sample["attn_mask"].cpu()
-            ni = sample["node_ids"].cpu()
-            gt = sample["gate_types"].cpu()
+            # Load the raw list from pickle, then stream through it entry-by-entry,
+            # nulling out each processed entry to release RAM progressively.
+            # This avoids keeping the full deserialized list alive for large chunks.
+            import time as _time
 
-            # Pad TO fixed size (logic duplicated from original code, but we reuse the
-            # result from __getitem__ if max_path_length matches)
-            # original code padded manually. Let's trust raw_ds[i] returns padded if we
-            # set max_path_length correctly?
-            # Actually raw_ds[i] pads to self.max_path_length.
+            tqdm.write(f"Loading {os.path.basename(chunk_path)} ...", end=" ", nolock=True)
+            _t0 = _time.time()
+            with open(chunk_path, "rb") as _f:
+                raw_list = pickle.load(_f)
+            tqdm.write(f"{len(raw_list):,} samples ({_time.time() - _t0:.1f}s)", nolock=True)
 
-            # GENERATE ANCHOR
-            # construct info for solver
-            # info is available in entry['info']
-            p_sel, l_sel, v_sel, s_sel = raw_ds._gen_anchor_for_sample(ni, am, file_path, info)
+            chunk_len = len(raw_list)
+            total += chunk_len
+            sample_pbar.reset(total=chunk_len)
+            sample_pbar.set_description(f"  {os.path.basename(chunk_path)}")
 
-            # GENERATE CONSTRAINTS (bake into shard)
-            c_mask = torch.zeros_like(ni, dtype=torch.bool)
-            c_vals = torch.zeros_like(ni, dtype=torch.long)
-            constraints = raw_ds._gen_constraints_for_sample(info, file_path)
-            if constraints and raw_ds.add_logic_value and pe.shape[-1] >= 3:
-                D = pe.shape[-1]
-                for nid, val in constraints.items():
-                    mask = ni == nid
-                    if mask.any():
-                        c_mask |= mask
-                        c_vals[mask] = int(val)
-                        vec = torch.tensor([1.0, 0.0, 0.0] if val == 0 else [0.0, 1.0, 0.0])
-                        pe.view(-1, D)[mask.view(-1), D - 3 : D] = vec
+            # Build a lightweight helper to reuse circuit caches (embedding + circuit).
+            # We instantiate a minimal ReconvergentPathsDataset without loading pickle.
+            helper = object.__new__(ReconvergentPathsDataset)
+            helper.dataset_path = chunk_path
+            helper.device = device
+            helper.max_path_length = max_path_length
+            helper.add_logic_value = True
+            helper.prefer_value = 1
+            helper._prefer_value = 1
+            helper.anchor_in_dataset = False
+            helper.inject_constraints = False
+            helper.constraint_prob = 0.0
+            helper.max_len_filter = 0
+            helper._use_processed = False
+            helper._circuit_cache: Dict[str, Any] = {}
+            helper._emb_cache: Dict[str, Any] = {}
 
-            # Inject anchor AFTER constraints so it cannot be overwritten.
-            # The anchor is the primary supervision signal; constraints are secondary.
-            if p_sel >= 0 and l_sel >= 0 and raw_ds.add_logic_value and pe.shape[-1] >= 3:
-                D = pe.shape[-1]
-                onehot = torch.tensor([1.0, 0.0, 0.0])
-                if v_sel == 1:
-                    onehot = torch.tensor([0.0, 1.0, 0.0])
-                pe[p_sel, l_sel, D - 3 : D] = onehot
+            for i in range(chunk_len):
+                sample_pbar.update(1)
+                entry = raw_list[i]
+                # Free the slot immediately after grabbing the entry
+                raw_list[i] = None  # type: ignore[assignment]
 
-            # Pad strictly to max_path_length for stacking
-            Pdim, Lcur, Ddim = pe.shape
-            Lfix = max_path_length
-            if Lcur < Lfix:
-                pe_pad = torch.zeros(Pdim, Lfix, Ddim, dtype=pe.dtype)
-                pe_pad[:, :Lcur, :] = pe
-                am_pad = torch.zeros(Pdim, Lfix, dtype=am.dtype)
-                am_pad[:, :Lcur] = am
-                ni_pad = torch.zeros(Pdim, Lfix, dtype=ni.dtype)
-                ni_pad[:, :Lcur] = ni
-                gt_pad = torch.full((Pdim, Lfix), -1, dtype=gt.dtype)
-                gt_pad[:, :Lcur] = gt
-                cm_pad = torch.zeros(Pdim, Lfix, dtype=c_mask.dtype)
-                cm_pad[:, :Lcur] = c_mask
-                cv_pad = torch.zeros(Pdim, Lfix, dtype=c_vals.dtype)
-                cv_pad[:, :Lcur] = c_vals
-                pe, am, ni, gt = pe_pad, am_pad, ni_pad, gt_pad
-                c_mask, c_vals = cm_pad, cv_pad
-            elif Lcur > Lfix:
-                raise RuntimeError(
-                    f"Path length {Lcur} exceeds max_path_length "
-                    f"{Lfix}. Upstream filtering has failed."
+                file_path = entry["file"]
+                info = entry["info"]
+
+                # Resolve embeddings (new format: circuit_emb path; old: inline)
+                is_new_format = "circuit_emb" in entry and entry["circuit_emb"] != ""
+                if is_new_format:
+                    struct_emb, gate_mapping_int = helper._load_circuit_emb_cached(
+                        entry["circuit_emb"]
+                    )
+                    has_embeddings = struct_emb is not None
+                else:
+                    has_embeddings = "struct_emb" in entry and "gate_mapping" in entry
+                    struct_emb = entry.get("struct_emb")
+                    gate_mapping_int = entry.get("_gate_mapping_int") or {
+                        int(k): int(v) for k, v in (entry.get("gate_mapping") or {}).items()
+                    }
+
+                paths = info["paths"]
+                P = len(paths)
+                D = struct_emb.shape[1] if (has_embeddings and struct_emb is not None) else 128
+                D_total = D + 3  # add_logic_value is always True here
+                max_len = max(len(p) for p in paths)
+                L = min(max_len, max_path_length)
+
+                pe = torch.zeros(P, L, D_total, dtype=torch.float16)
+                am = torch.zeros(P, L, dtype=torch.bool)
+                ni = torch.zeros(P, L, dtype=torch.long)
+                gt = torch.full((P, L), -1, dtype=torch.long)
+                pe[..., -1] = 1.0  # default: Unknown
+
+                circuit = helper._load_circuit_cached(file_path)
+                unique_nodes = {nid for path in paths for nid in path[:L] if nid > 0}
+                node_info: Dict[int, Any] = {}
+                for nid in unique_nodes:
+                    gty = int(circuit[nid].type) if nid < len(circuit) else -1
+                    emb = struct_emb[gate_mapping_int[nid]] if nid in gate_mapping_int else None
+                    if emb is None:
+                        emb = torch.zeros(D) if has_embeddings else torch.randn(D)
+                    node_info[nid] = (gty, emb)
+
+                for p, path in enumerate(paths):
+                    for pos in range(min(len(path), L)):
+                        nid = path[pos]
+                        if nid <= 0:
+                            continue
+                        ni[p, pos] = nid
+                        am[p, pos] = True
+                        gty, emb = node_info[nid]
+                        gt[p, pos] = gty
+                        pe[p, pos, :D] = emb
+
+                pe = pe.to(torch.float32)
+
+                # GENERATE ANCHOR
+                entry_labels = entry.get("labels")
+                reconv_node = info.get("reconv")
+                has_precomputed = (
+                    entry_labels is not None
+                    and reconv_node is not None
+                    and reconv_node in entry_labels
                 )
+                if has_precomputed:
+                    rv = int(entry_labels[reconv_node])
+                    if rv in (0, 1):
+                        path0_mask = am[0].bool()
+                        l_sel = int(path0_mask.sum().item()) - 1
+                        p_sel, v_sel, s_sel = 0, rv, 1
+                    else:
+                        p_sel, l_sel, v_sel, s_sel = -1, -1, -1, 1
+                else:
+                    p_sel, l_sel, v_sel, s_sel = helper._gen_anchor_for_sample(
+                        ni, am, file_path, info
+                    )
 
-            buf_paths.append(pe)
-            buf_masks.append(am)
-            buf_nodes.append(ni)
-            buf_gt.append(gt)
-            buf_cmask.append(c_mask)
-            buf_cvals.append(c_vals)
-            buf_files.append(file_path)
+                # BAKE CONSTRAINTS
+                c_mask = torch.zeros_like(ni, dtype=torch.bool)
+                c_vals = torch.zeros_like(ni, dtype=torch.long)
+                entry_constraints = entry.get("constraints")
+                constraint_source = (
+                    entry_constraints
+                    if entry_constraints is not None
+                    else helper._gen_constraints_for_sample(info, file_path)
+                )
+                if constraint_source and pe.shape[-1] >= 3:
+                    D_pe = pe.shape[-1]
+                    for nid, val in constraint_source.items():
+                        mask = ni == nid
+                        if mask.any():
+                            c_mask |= mask
+                            c_vals[mask] = int(val)
+                            vec = torch.tensor(
+                                [1.0, 0.0, 0.0] if val == 0 else [0.0, 1.0, 0.0]
+                            )
+                            pe.view(-1, D_pe)[mask.view(-1), D_pe - 3 : D_pe] = vec
 
-            buf_ap.append(int(p_sel))
-            buf_al.append(int(l_sel))
-            buf_av.append(int(v_sel))
-            buf_solv.append(int(s_sel))
+                # Inject anchor AFTER constraints
+                if p_sel >= 0 and l_sel >= 0 and pe.shape[-1] >= 3:
+                    D_pe = pe.shape[-1]
+                    onehot = (
+                        torch.tensor([0.0, 1.0, 0.0])
+                        if v_sel == 1
+                        else torch.tensor([1.0, 0.0, 0.0])
+                    )
+                    pe[p_sel, l_sel, D_pe - 3 : D_pe] = onehot
 
-            if len(buf_paths) >= shard_size:
-                flush()
+                # Pad to max_path_length
+                Pdim, Lcur, Ddim = pe.shape
+                Lfix = max_path_length
+                if Lcur < Lfix:
+                    pe_pad = torch.zeros(Pdim, Lfix, Ddim, dtype=pe.dtype)
+                    pe_pad[:, :Lcur, :] = pe
+                    am_pad = torch.zeros(Pdim, Lfix, dtype=am.dtype)
+                    am_pad[:, :Lcur] = am
+                    ni_pad = torch.zeros(Pdim, Lfix, dtype=ni.dtype)
+                    ni_pad[:, :Lcur] = ni
+                    gt_pad = torch.full((Pdim, Lfix), -1, dtype=gt.dtype)
+                    gt_pad[:, :Lcur] = gt
+                    cm_pad = torch.zeros(Pdim, Lfix, dtype=c_mask.dtype)
+                    cm_pad[:, :Lcur] = c_mask
+                    cv_pad = torch.zeros(Pdim, Lfix, dtype=c_vals.dtype)
+                    cv_pad[:, :Lcur] = c_vals
+                    pe, am, ni, gt = pe_pad, am_pad, ni_pad, gt_pad
+                    c_mask, c_vals = cm_pad, cv_pad
+                elif Lcur > Lfix:
+                    raise RuntimeError(
+                        f"Path length {Lcur} exceeds max_path_length "
+                        f"{Lfix}. Upstream filtering has failed."
+                    )
+
+                buf_paths.append(pe)
+                buf_masks.append(am)
+                buf_nodes.append(ni)
+                buf_gt.append(gt)
+                buf_cmask.append(c_mask)
+                buf_cvals.append(c_vals)
+                buf_files.append(file_path)
+
+                buf_ap.append(int(p_sel))
+                buf_al.append(int(l_sel))
+                buf_av.append(int(v_sel))
+                buf_solv.append(int(s_sel))
+
+                if len(buf_paths) >= shard_size:
+                    flush()
+
+                # Periodic GC to reclaim nulled-out raw_list entries
+                if i > 0 and i % 50000 == 0:
+                    gc.collect()
+
+            # Release the raw list and helper caches, then force GC
+            del raw_list, helper
+            gc.collect()
+
+            # Save progress after each chunk so we can resume on crash
+            done_chunks.add(chunk_path)
+            with open(progress_path, "w") as _pf:
+                json.dump(
+                    {
+                        "done_chunks": sorted(done_chunks),
+                        "total_samples": total,
+                        "next_shard_idx": shard_idx,
+                    },
+                    _pf,
+                )
+        sample_pbar.close()
+        chunk_pbar.close()
         flush()
 
         shards = sorted(glob.glob(os.path.join(output_dir, "shard_*.pt")))
@@ -1064,7 +1277,7 @@ if __name__ == "__main__":
         "--shard_size",
         dest="shard_size",
         type=int,
-        default=5000,
+        default=50000,
         help="Number of samples per shard file",
     )
     parser.add_argument(
@@ -1074,6 +1287,13 @@ if __name__ == "__main__":
         default="float16",
         choices=["float16", "float32"],
         help="Data type for stored embeddings",
+    )
+
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        default=False,
+        help="Resume from progress.json in output dir, skipping already-processed chunks",
     )
 
     args = parser.parse_args()
@@ -1086,6 +1306,7 @@ if __name__ == "__main__":
         shard_size=args.shard_size,
         dtype=dtype,
         device=torch.device("cpu"),
+        resume=args.resume,
     )
 
 

@@ -38,7 +38,6 @@ from src.ml.core.dataset import (
     ShardBatchSampler,
     _generate_anchor,
     _inject_anchor_into_embeddings,
-    generate_constraints,
     resolve_gate_types,
 )
 from src.ml.core.loss import (
@@ -49,80 +48,6 @@ from src.ml.core.model import MultiPathTransformer
 
 # Suppress annoying prototype warnings from PyTorch transformer
 warnings.filterwarnings("ignore", message="The PyTorch API of nested tensors is in prototype stage")
-
-
-def _curriculum_constraint_prob(epoch: int, total_epochs: int) -> float:
-    """Return constraint probability for curriculum training.
-
-    Phase 1 (first 10% epochs): 0%
-    Phase 2 (remaining 90%): fixed 0.8
-    """
-    if total_epochs <= 0:
-        return 0.0
-
-    free_epochs = max(1, total_epochs // 10)
-    if epoch <= free_epochs:
-        return 0.0
-
-    return 0.8
-
-
-def _build_training_constraints(
-    node_ids: torch.Tensor,
-    masks: torch.Tensor,
-    epoch: int,
-    total_epochs: int,
-    terminus_vals: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Generate curriculum constraints with always-constrained path termini.
-
-    Args:
-        terminus_vals: [B] optional pre-computed terminus targets (e.g. from anchor).
-            If None, random 0/1 is used per sample. Providing circuit-consistent values
-            (from the anchor) avoids conflicts with gate-logic loss and reduces c_viol.
-
-    Returns:
-        constraint_mask: [B, P, L] bool
-        constraint_vals: [B, P, L] long (0 or 1)
-    """
-    device = node_ids.device
-    B, P, _ = node_ids.shape
-    valid_nodes = masks & (node_ids > 0)
-
-    c_mask = torch.zeros_like(node_ids, dtype=torch.bool)
-    c_vals = torch.zeros_like(node_ids, dtype=torch.long)
-
-    # Pick one target value per sample and apply it to all valid path termini.
-    # Prefer circuit-consistent values derived from anchor over pure random.
-    if terminus_vals is None:
-        terminus_vals = torch.randint(0, 2, (B,), device=device, dtype=torch.long)
-
-    # Vectorised terminus detection — replaces the O(B*P) Python loop.
-    # valid_len[b, p] = number of valid positions in path p of sample b.
-    valid_len = masks.long().sum(dim=2)  # [B, P]
-    term_idx = (valid_len - 1).clamp(min=0)  # [B, P] index of last valid position
-    has_valid = valid_len > 0  # [B, P]
-
-    # Gather node_ids at the terminus position for each (b, p).
-    term_node = node_ids.gather(2, term_idx.unsqueeze(2)).squeeze(2)  # [B, P]
-    terminus_ok = has_valid & (term_node > 0)  # [B, P]
-
-    # Write terminus constraint: scatter True/value only where terminus_ok.
-    c_mask.scatter_(2, term_idx.unsqueeze(2), terminus_ok.unsqueeze(2))
-    # Broadcast terminus_vals [B] -> [B, P] -> [B, P, 1] for scatter.
-    tv_bp = terminus_vals.unsqueeze(1).expand(B, P)
-    c_vals.scatter_(2, term_idx.unsqueeze(2), (tv_bp * terminus_ok.long()).unsqueeze(2))
-
-    # Additional constraints follow stepped curriculum only on non-terminus nodes.
-    extra_prob = _curriculum_constraint_prob(epoch, total_epochs)
-    if extra_prob > 0.0:
-        extra_candidates = valid_nodes & (~c_mask)
-        sampled = (torch.rand_like(node_ids, dtype=torch.float) < extra_prob) & extra_candidates
-        c_mask = c_mask | sampled
-        random_vals = torch.randint_like(node_ids, 0, 2)
-        c_vals[sampled] = random_vals[sampled]
-
-    return c_mask, c_vals
 
 
 def _shuffle_paths_training_batch(
@@ -212,11 +137,6 @@ class TrainConfig:
     max_len: int = 0
     use_gate_type_embedding: bool = True
 
-    # Phase 6: Constrained Training
-    constrained_curriculum: bool = False
-    inject_constraints: bool = False
-    max_constraint_prob: float = 0.5
-    enforce_constraints: bool = True
     processed_dir: Optional[str] = None
 
     # Phase 7: Logic Consistency
@@ -289,8 +209,8 @@ def make_dataloaders(cfg: TrainConfig, device: torch.device) -> Tuple[DataLoader
         anchor_in_dataset=cfg.dataset_anchor_hint,
         max_len_filter=cfg.max_len,
         cache_size=cfg.shard_cache_size,
-        inject_constraints=cfg.inject_constraints,
-        constraint_prob=cfg.max_constraint_prob if cfg.inject_constraints else 0.0,
+        inject_constraints=False,
+        constraint_prob=0.0,
     )
 
     # Use ShardBatchSampler when shards are available: groups all indices from the
@@ -477,16 +397,6 @@ def train_one_epoch(
             else min(cfg.max_train_batches, target_batches)
         )
 
-    constraint_prob = (
-        _curriculum_constraint_prob(epoch, cfg.epochs) if cfg.constrained_curriculum else 0.0
-    )
-
-    if cfg.verbose:
-        free_epochs_disp = max(1, cfg.epochs // 10)
-        print(
-            f"[curriculum] epoch={epoch} constraint_prob={constraint_prob:.3f} "
-            f"(Phase {'1' if epoch <= free_epochs_disp else '2'})"
-        )
 
     if cfg.verbose:
         print(f"Starting epoch {epoch} loop (waiting for DataLoader)...", flush=True)
@@ -494,7 +404,7 @@ def train_one_epoch(
     gumbel_t = max(0.1, cfg.gumbel_temp * (cfg.gumbel_anneal_rate ** (epoch - 1)))
 
     pbar = tqdm(loader, desc=f"Epoch {epoch}", total=target_batches, unit="batch")
-    pbar.set_postfix({"c_prob": f"{constraint_prob:.0%}"})
+    pbar.set_postfix({})
 
     for batch_idx, batch in enumerate(pbar):
         paths = batch["paths_emb"].to(device, non_blocking=True)
@@ -544,58 +454,17 @@ def train_one_epoch(
         if gtypes is None:
             raise RuntimeError("Gate types must be available during training.")
 
-        # 1. Initialize Logic Value Vector to "Unknown" [0, 0, 1] ONLY IF dataset didn't do it
-        # (inject_constraints=True in dataset already handles this)
-        if cfg.add_logic_value and not cfg.inject_constraints:
+        # Initialize Logic Value Vector to "Unknown" [0, 0, 1]; dataset injects
+        # known constraint values on top of this baseline.
+        if cfg.add_logic_value:
             D_cur = paths.shape[-1]
             if D_cur >= 3:
-                # We initialize to [0, 0, 1] (Unknown)
                 paths[..., D_cur - 3] = 0.0
                 paths[..., D_cur - 2] = 0.0
                 paths[..., D_cur - 1] = 1.0
 
-        # 2. Curriculum constraints: phase-1 terminus-only, then stepped ramp constraints.
-        if cfg.constrained_curriculum:
-            # Derive circuit-consistent terminus targets from the batch anchor when
-            # the anchor node sits at the path terminus.  This replaces pure-random
-            # values that conflict with gate-logic ~22% of the time and cause a
-            # training plateau that no amount of extra epochs can resolve.
-            _terminus_vals: Optional[torch.Tensor] = None
-            if batch_anchor_p is not None:
-                al_batch = batch.get("anchor_l")
-                av_batch = batch.get("anchor_v")
-                if al_batch is not None and av_batch is not None:
-                    al_dev = al_batch.to(device)
-                    av_dev = av_batch.to(device)
-                    B_cur = node_ids.shape[0]
-                    valid_anchor = batch_anchor_p >= 0
-                    if valid_anchor.any():
-                        anc_p_safe = batch_anchor_p.clamp(0, masks.shape[1] - 1)
-                        anc_lens = (
-                            masks[torch.arange(B_cur, device=device), anc_p_safe].long().sum(dim=1)
-                        )
-                        anc_terminus = (anc_lens - 1).clamp(min=0)
-                        at_term = valid_anchor & (al_dev == anc_terminus) & (av_dev >= 0)
-                        if at_term.any():
-                            _terminus_vals = torch.randint(
-                                0, 2, (B_cur,), device=device, dtype=torch.long
-                            )
-                            _terminus_vals[at_term] = av_dev[at_term].long().clamp(0, 1)
-            c_mask, c_vals = _build_training_constraints(
-                node_ids=node_ids,
-                masks=masks,
-                epoch=epoch,
-                total_epochs=cfg.epochs,
-                terminus_vals=_terminus_vals,
-            )
-        elif c_mask is None and not cfg.inject_constraints:
-            c_prob = cfg.max_constraint_prob
-            if c_prob > 0:
-                c_mask, c_vals = generate_constraints(node_ids, files, c_prob)
-                c_mask = c_mask.to(device)
-                c_vals = c_vals.to(device)
-
-        # 3. Inject constraints (either from batch or manually generated) into embeddings
+        # Re-inject dataset constraints into the LVV so the model sees them.
+        # c_mask/c_vals are baked by build_fault_dataset.py (circuit-consistent).
         if cfg.add_logic_value and c_mask is not None and c_vals is not None:
             if c_mask.any():
                 D = paths.shape[-1]
@@ -751,7 +620,6 @@ def train_one_epoch(
             )
             pbar.set_postfix(
                 {
-                    "c_prob": f"{constraint_prob:.0%}",
                     "loss": f"{total_loss / max(1, total_batches):.4f}",
                     "path_acc": f"{total_valid / max(1, total_batches):.4f}",
                     "solv": f"{dbg['solvability_acc']:.3f}",
@@ -778,7 +646,6 @@ def evaluate(
     loader: DataLoader,
     device: torch.device,
     cfg: TrainConfig,
-    epoch: int = 1,
 ) -> Tuple[float, float, float, float, float]:
     model.eval()
     (
@@ -827,49 +694,16 @@ def evaluate(
         else:
             anchor_p = anchor_l = anchor_v = solv_labels = None  # type: ignore
 
-        # 1. Initialize Logic Value Vector to "Unknown" [0, 0, 1] ONLY IF dataset didn't do it
-        if cfg.add_logic_value and not cfg.inject_constraints:
+        # Initialize Logic Value Vector to "Unknown" [0, 0, 1]; dataset injects
+        # known constraint values on top of this baseline.
+        if cfg.add_logic_value:
             D_cur = paths.shape[-1]
             if D_cur >= 3:
                 paths[..., D_cur - 3] = 0.0
                 paths[..., D_cur - 2] = 0.0
                 paths[..., D_cur - 1] = 1.0
 
-        # 2. Keep evaluation curriculum-consistent with training schedule.
-        if cfg.constrained_curriculum:
-            # Mirror the anchor-guided terminus derivation used in train_one_epoch
-            # so validation c_viol is measured on achievable constraint targets.
-            _eval_terminus_vals: Optional[torch.Tensor] = None
-            if anchor_p is not None and anchor_l is not None and anchor_v is not None:
-                B_cur = node_ids.shape[0]
-                valid_anchor = anchor_p >= 0
-                if valid_anchor.any():
-                    anc_p_safe = anchor_p.clamp(0, masks.shape[1] - 1)
-                    anc_lens = (
-                        masks[torch.arange(B_cur, device=device), anc_p_safe].long().sum(dim=1)
-                    )
-                    anc_terminus = (anc_lens - 1).clamp(min=0)
-                    at_term = valid_anchor & (anchor_l == anc_terminus) & (anchor_v >= 0)
-                    if at_term.any():
-                        _eval_terminus_vals = torch.randint(
-                            0, 2, (B_cur,), device=device, dtype=torch.long
-                        )
-                        _eval_terminus_vals[at_term] = anchor_v[at_term].long().clamp(0, 1)
-            c_mask, c_vals = _build_training_constraints(
-                node_ids=node_ids,
-                masks=masks,
-                epoch=epoch,
-                total_epochs=cfg.epochs,
-                terminus_vals=_eval_terminus_vals,
-            )
-        elif c_mask is None and not cfg.inject_constraints:
-            c_prob = cfg.max_constraint_prob
-            if c_prob > 0:
-                c_mask, c_vals = generate_constraints(node_ids, files, c_prob)
-                c_mask = c_mask.to(device)
-                c_vals = c_vals.to(device)
-
-        # 3. Inject constraints into embeddings
+        # Re-inject dataset constraints into the LVV.
         if cfg.add_logic_value and c_mask is not None and c_vals is not None:
             if c_mask.any():
                 D = paths.shape[-1]
@@ -1017,8 +851,6 @@ def cmd_train(args: argparse.Namespace) -> None:
         soft_edge_lambda=getattr(args, "soft_edge_lambda", 1.0),
         max_len=getattr(args, "max_len", 0),
         entropy_beta=getattr(args, "entropy_beta", 0.0),
-        constrained_curriculum=getattr(args, "constrained_curriculum", False),
-        max_constraint_prob=getattr(args, "max_constraint_prob", 0.5),
         processed_dir=getattr(args, "processed_dir", None),
         lambda_logic=getattr(args, "lambda_logic", 0.0),
         lambda_full_logic=getattr(args, "lambda_full_logic", 0.0),
@@ -1028,7 +860,6 @@ def cmd_train(args: argparse.Namespace) -> None:
         checkpointing=getattr(args, "checkpointing", False),
         shard_cache_size=getattr(args, "shard_cache_size", 10),
         max_paths=getattr(args, "max_paths", 200),
-        inject_constraints=getattr(args, "inject_constraints", False),
         pretrained=getattr(args, "pretrained", None),
         lambda_solvability=getattr(args, "lambda_solvability", 1.0),
         lambda_constraint=getattr(args, "lambda_constraint", 1.0),
@@ -1217,7 +1048,7 @@ def cmd_train(args: argparse.Namespace) -> None:
                     model, train_loader, optim, scaler, device, cfg, epoch=epoch
                 )
                 va_loss, va_reward, va_acc, va_edge, va_c_viol = evaluate(
-                    model, val_loader, device, cfg, epoch=epoch
+                    model, val_loader, device, cfg
                 )
                 break  # success — exit retry loop
             except Exception as exc:
@@ -1358,23 +1189,6 @@ def build_argparser() -> argparse.ArgumentParser:
         help="Include hard negatives (currently ignored)",
     )
     t.add_argument("--epochs", type=int, default=10)
-    t.add_argument(
-        "--constrained-curriculum",
-        action="store_true",
-        help="Enable constrained path training curriculum (random constraints in loop)",
-    )
-    t.add_argument(
-        "--inject-constraints",
-        action="store_true",
-        help="Enable solver-consistent constraint injection at dataset level",
-    )
-    t.add_argument(
-        "--max-constraint-prob",
-        type=float,
-        default=0.5,
-        help="Maximum probability of masking a constrained node",
-    )
-
     t.add_argument("--batch-size", type=int, default=128)
     t.add_argument("--verbose", action="store_true")
     # Model capacity
