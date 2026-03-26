@@ -224,9 +224,11 @@ def make_dataloaders(cfg: TrainConfig, device: torch.device) -> Tuple[DataLoader
         # Keep all shards resident — set cache_size to total shards before warmup,
         # otherwise the default cache_size=1 would evict shards during warmup and
         # get_shard_batch() would raise KeyError when it tries to access an evicted shard.
-        dataset.cache_size = len(dataset._shard_lens)
-        dataset.warmup_shards(0)  # 0 = all shards
-        print(f"Dataset ready: {len(dataset)} samples across {len(dataset._shard_lens)} shards.")
+        # With 5000+ shards on NFS, loading all into RAM is not feasible.
+        # Use a modest LRU cache instead; shards are loaded lazily per batch.
+        dataset.cache_size = min(cfg.shard_cache_size, len(dataset._shard_lens))
+        print(f"Dataset ready: {len(dataset)} samples across {len(dataset._shard_lens)} shards "
+              f"(LRU cache size: {dataset.cache_size}).")
 
         # Split at the shard level: last 10% of shards → val, rest → train.
         n_shards = len(dataset._shard_lens)

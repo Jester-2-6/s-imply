@@ -105,17 +105,20 @@ A critical concept determining local autonomy is the presence of \textit{Exit Li
 Rather than treating the local circuit region as an unstructured set of nodes, we explicitly model the distinct branches of a reconvergent structure. Our model employs a Multi-Path Transformer parameterized to simultaneously process independent parallel paths while facilitating global cross-branch attention.
 
 \subsubsection{Feature Representation and Multi-Modal Embeddings}
-For each node $v_i \in P_j$, we construct a multi-modal input embedding $\mathbf{x}_i \in \mathbb{R}^{d\_{total}}$ by concatenating structural and constraint-aware signals:
+For each node $v_i \in P_j$, a base feature vector $\mathbf{x}_i^{\text{base}} \in \mathbb{R}^{d_{\text{base}}}$ is assembled by concatenating structural and constraint-aware signals:
 \begin{equation}
-   \mathbf{x}_i = [\mathbf{h}\_{struct}(v_i) \parallel \mathbf{c}(v_i) \parallel \mathbf{e}\_{gate}(t_i)]
+   \mathbf{x}_i^{\text{base}} = [\mathbf{h}_{\text{struct}}(v_i) \parallel \mathbf{c}(v_i)]
 \end{equation}
-where $\parallel$ denotes the concatenation operator.
+where $\parallel$ denotes concatenation. This base vector is augmented on-the-fly with a learned gate-type embedding before the input projection:
+\begin{equation}
+   \mathbf{x}_i = [\mathbf{x}_i^{\text{base}} \parallel \mathbf{e}_{\text{gate}}(t_i)] \in \mathbb{R}^{d_{\text{total}}}
+\end{equation}
 \begin{enumerate}
-   \item \textbf{DeepGate Structural Embedding ($\mathbf{h}\_{struct} \in \mathbb{R}^{128}$)}: Extracted from a pre-trained GNN (DeepGate) that encodes circuit topology by predicting logic-1 probabilities via message passing on And-Inverter Graphs \cite{deepgate}. This vector encapsulates both the global topological context and the functional behavioral signature of each node.
-   \item \textbf{Logic Constraint Channels ($\mathbf{c} \in \mathbb{R}^{4}$)}: A four-dimensional binary vector encoding the ATPG implication state of each node: \texttt{[is\_constrained, value\_is\_zero, value\_is\_one, reserved]}. This allows the model to condition its predictions on partial assignments already established by PODEM backtracing.
-   \item \textbf{Gate Type Lexicon ($\mathbf{e}\_{gate} \in \mathbb{R}^{64}$)}: A learned embedding for each discrete gate operator $t_i$, drawn from a vocabulary of 12 types covering \texttt{INPT, FROM, BUFF, NOT, AND, NAND, OR, NOR, XOR, XNOR}. This lexicon ensures the model distinguishes inversion boundaries from non-inverting propagation.
+   \item \textbf{DeepGate Structural Embedding ($\mathbf{h}_{\text{struct}} \in \mathbb{R}^{128}$)}: Extracted from a pre-trained GNN (DeepGate) that encodes circuit topology by predicting logic-1 probabilities via message passing on And-Inverter Graphs \cite{deepgate}. This vector encapsulates both the global topological context and the functional behavioral signature of each node. Embeddings are cached per circuit in a \texttt{.deepgate\_cache/} directory to avoid redundant inference.
+   \item \textbf{Logic Constraint Channels ($\mathbf{c} \in \mathbb{R}^{4}$)}: A four-dimensional one-hot vector encoding the ATPG five-valued implication state of each node drawn from \{ZERO, ONE, XD, D, $\overline{D}$\}. Three of these dimensions encode the constraint visible at inference time (\texttt{[unknown, zero, one]}), conditioned on partial PI assignments accumulated by PODEM backtracing.
+   \item \textbf{Gate Type Lexicon ($\mathbf{e}_{\text{gate}} \in \mathbb{R}^{64}$)}: A learned embedding for each discrete gate operator $t_i$, drawn from a vocabulary of 12 types covering \texttt{INPT, FROM, BUFF, NOT, AND, NAND, OR, NOR, XOR, XNOR} and two auxiliary types. This lexicon ensures the model distinguishes inversion boundaries from non-inverting propagation.
 \end{enumerate}
-The concatenated dimension $d\_{total} = 196$ is projected into the Transformer's model dimension $d\_{model}=512$ via a learned linear layer.
+The base dimension $d_{\text{base}} = 132$ (128 structural + 4 constraint). After gate-type augmentation, $d_{\text{total}} = 196$, which is projected into the Transformer's model dimension $d_{\text{model}} = 512$ via a learned linear layer.
 
 \subsubsection{Shared Path and Interaction Encoders}
 Let the input matrix for path $j$ be $X^{(j)} = [x_1^{(j)}, \ldots, x_{N_j}^{(j)}]^T \in \mathbb{R}^{N_j \times d}$. We compute an intermediate node representation $H^{(j)}$ through a shared path encoder:
@@ -140,34 +143,34 @@ The independent node elements $H^{(j)}$ reconcile against the interactive constr
 \begin{equation}
    \text{Context}_i^{(j)} = \sum_{m=1}^M \text{Head}_m(h_i^{(j)}, \hat{Z}, \hat{Z})
 \end{equation}
-where $M=4$ is the number of attention heads. The cross-attention mechanism effectively allows each node to ``poll'' the global interaction summaries for consistency constraints. The updated state $y_i^{(j)} = \text{LayerNorm}(h_i^{(j)} + \text{Context}_i^{(j)})$ is projected through parallel classification heads:
+where $M=4$ is the number of attention heads. The cross-attention mechanism effectively allows each node to ``poll'' the global interaction summaries for consistency constraints. The updated state incorporates both the cross-attention result and the path's own interaction-aware summary $\hat{z}^{(j)}$ via a triple residual:
+\begin{equation}
+   y_i^{(j)} = \text{LayerNorm}\!\left(h_i^{(j)} + \text{Context}_i^{(j)} + \hat{z}^{(j)}\right)
+\end{equation}
+This final state $y_i^{(j)}$ is projected through parallel classification heads:
 \begin{itemize}
    \item \textbf{Logic Polarity Head}: A linear projection $W\_p \in \mathbb{R}^{d\_{model} \times 2}$ maps each $y_i^{(j)}$ to binary logits $P(\text{val}(v_i) = c) \in \mathbb{R}^2$.
    \item \textbf{Regional Solvability Head}: $S\_{LRR} \in \mathbb{R}^2$ is computed by applying a linear projection to the mean of the interaction-aware path summaries $\hat{z}^{(j)}$: $S\_{LRR} = W\_s \cdot \frac{1}{|P|} \sum_j \hat{z}^{(j)}$. This provides a circuit-level solvability estimate grounded in inter-branch consistency.
 \end{itemize}
 
 \subsection{Differentiable Logical Training Framework}
-Directly training a neural network on discrete Boolean gates is unfeasible as $\partial v / \partial u$ is zero almost everywhere. We solve this by implementing an end-to-end differentiable surrogate of Boolean logic.
-
-A fundamental challenge in training neural models over Boolean circuits is the discrete nature of logic gates, which prohibits direct gradient backpropagation. We overcome this by utilizing the Gumbel-Softmax estimator for continuous relaxation.
+A fundamental challenge in training neural models over Boolean circuits is that $\partial v / \partial u = 0$ almost everywhere for discrete gate functions, prohibiting direct gradient backpropagation. This section describes how the Gumbel-Softmax estimator is used to construct a fully differentiable surrogate, and defines the multi-objective loss that enforces circuit-consistent predictions.
 
 \subsubsection{Gradient Reparameterization}
-Let $l_v \in \mathbb{R}^2$ be the logits for node $v$. During training, we sample differentiable assignments $a_v$ as:
+Let $l_v \in \mathbb{R}^2$ be the logits for node $v$. During training, differentiable soft assignments $a_v$ are sampled using the Gumbel-Softmax estimator \cite{jang2016categorical} with a straight-through estimator:
 \begin{equation}
-   a\_{v} = \frac{\exp((l\_{v,1} + g\_{v,1})/\tau)}{\sum_{j=0}^{1} \exp((l\_{v,j} + g\_{v,j})/\tau)}
+   a_{v} = \frac{\exp((l_{v,1} + g_{v,1})/\tau)}{\sum_{j=0}^{1} \exp((l_{v,j} + g_{v,j})/\tau)}
 \end{equation}
-where $g\_{v,j} \sim \text{Gumbel}(0,1)$. The temperature $\tau$ controls sharpness: at high $\tau$ the distribution is soft and exploration is high; as $\tau \to 0$ the output concentrates on the argmax (discrete). We employ per-epoch multiplicative annealing:
-\begin{equation}
-   \tau\_t = \max\!\left(0.1,\; \tau\_0 \cdot \alpha^{\,t-1}\right)
-\end{equation}
-with initial temperature $\tau\_0 = 1.0$ and decay factor $\alpha = 0.99$, yielding a floor temperature of $0.1$ after sufficient epochs.
+where $g_{v,j} \sim \text{Gumbel}(0,1)$. With \texttt{hard=True}, the forward pass produces discrete one-hot values while the backward pass propagates gradients through the continuous Gumbel-Softmax distribution, allowing end-to-end differentiation through discrete gate-logic checks. The temperature $\tau$ is annealed per epoch as described in Section~\ref{sec:training_opt}.
 
 \subsubsection{Multi-Objective Logic Loss}
 The model is optimized via a weighted composite loss function:
 \begin{equation}
-   L\_{total} = \lambda\_{e} \mathcal{L}\_{edge} + \lambda\_{r} \mathcal{L}\_{reconv} + \lambda\_{c} \mathcal{L}\_{const} + \lambda\_{s} \mathcal{L}\_{solv} - \beta\_{H} \mathcal{H}
+   \mathcal{L}_{\text{total}} = \lambda_e \mathcal{L}_{\text{edge}} + \lambda_r \mathcal{L}_{\text{reconv}}
+     + \lambda_c \mathcal{L}_{\text{const}} + \lambda_s \mathcal{L}_{\text{solv}}
+     + \lambda_{\text{sn}} \mathcal{L}_{\text{shared}} - \beta_H \mathcal{H}
 \end{equation}
-with default weights $\lambda\_{e} = \lambda\_{r} = \lambda\_{c} = \lambda\_{s} = 1.0$ and entropy coefficient $\beta\_{H} = 0.01$.
+The total loss is computed as the sum of all active terms; default scalar weights are $\lambda_e = 1.0$, $\lambda_r = 0.5$ (scaled to balance against $\mathcal{L}_{\text{edge}}$), $\lambda_c = 1.0$, $\lambda_s = 1.0$, $\lambda_{\text{sn}} = 1.0$, and entropy coefficient $\beta_H = 0.01$. The solvability loss applies an asymmetric class weight of $w_{\text{UNSAT}} = 10$, $w_{\text{SAT}} = 1$ to address severe label imbalance.
 
 \textbf{Soft Edge Consistency ($\mathcal{L}\_{edge}$)}: Rather than enforcing hard gate truth tables, we impose a soft differentiable penalty on gate-logic violations using the Gumbel-Softmax probabilities $a\_v \in [0,1]$. For a single-input gate, violations are measured exactly; for multi-input AND/OR families, a hinge formulation penalizes only infeasible output values, since controlling inputs can produce valid logic even in partial assignments:
 \begin{itemize}
@@ -186,13 +189,20 @@ Gate-type weights are $\omega\_g = 2.0$ for \textit{rigid gates} (NOT, BUFF) whe
    \bar{l}\_{v\_r} = \frac{1}{|P|}\sum_j l\_{v\_r}^{(j)}, \qquad
    \mathcal{L}\_{reconv} = \frac{1}{|P|}\sum_j \left\| l\_{v\_r}^{(j)} - \bar{l}\_{v\_r} \right\|^2
 \end{equation}
-Operating on logits rather than discrete samples preserves full gradient flow through the penalty. The loss is weighted by 0.5 to balance its scale relative to the edge loss.
+Operating on logits rather than discrete samples preserves full gradient flow through the penalty. The loss is scaled by $\lambda_r = 0.5$ to balance its magnitude relative to the edge loss.
 
-\textbf{Constraint Supervision ($\mathcal{L}\_{const}$)}: A subset of nodes are designated as \textit{anchor} nodes with circuit-verified Boolean values (derived from random PI simulation on the training circuit). For these nodes, a cross-entropy supervision loss is applied:
+\textbf{Shared-Node Consistency ($\mathcal{L}_{\text{shared}}$)}: A circuit node may appear on multiple reconvergent paths simultaneously (i.e., it is a shared stem). An unconstrained model may assign contradictory values to the same node across different paths. For every node $v$ that appears at $K \geq 2$ valid positions within a batch sample, the variance of the predicted probability $P(\text{val}(v)=1)$ across those positions is penalized:
 \begin{equation}
-   \mathcal{L}\_{const} = -\frac{1}{|\mathcal{A}|} \sum_{(v,c) \in \mathcal{A}} \log P(\text{val}(v) = c)
+   \mathcal{L}_{\text{shared}} = \frac{1}{|\mathcal{S}|}\sum_{v \in \mathcal{S}}
+      \frac{1}{K_v}\sum_{k=1}^{K_v}\!\left(p_v^{(k)} - \bar{p}_v\right)^2
 \end{equation}
-where $\mathcal{A}$ denotes the set of anchor node–value pairs. This provides circuit-consistent gradient signal grounding model predictions in real Boolean assignments.
+where $\mathcal{S}$ is the set of nodes appearing on $\geq 2$ paths, $K_v$ is the count of such appearances, $p_v^{(k)}$ is the Gumbel-Softmax probability at the $k$-th occurrence, and $\bar{p}_v$ is the mean over all occurrences.
+
+\textbf{Constraint Supervision ($\mathcal{L}_{\text{const}}$)}: A subset of nodes are designated as \textit{anchor} nodes with circuit-verified Boolean values derived from real Primary Input assignments accumulated by the hierarchical solver. For these nodes, a cross-entropy supervision loss is applied:
+\begin{equation}
+   \mathcal{L}_{\text{const}} = -\frac{1}{|\mathcal{A}|} \sum_{(v,c) \in \mathcal{A}} \log P(\text{val}(v) = c)
+\end{equation}
+where $\mathcal{A}$ denotes the set of anchor node--value pairs. Anchor supervision is restricted to SAT-labeled samples (solvability label $= 0$) to avoid imposing contradictory gradients on structurally infeasible assignments.
 
 \textbf{Entropy Regularization ($\mathcal{H}$)}: To prevent premature prediction collapse, we add an entropy bonus:
 \begin{equation}
@@ -200,43 +210,69 @@ where $\mathcal{A}$ denotes the set of anchor node–value pairs. This provides 
 \end{equation}
 which penalizes overconfident distributions and sustains exploratory capacity across the curriculum.
 
-\subsubsection{Constraint Curriculum and Anchor Augmentation}
-Training employs a two-phase constraint curriculum that progressively increases the density of supervised guidance provided to the model.
+\subsubsection{Constraint Curriculum and Anchor Injection}
+Training data is generated by \texttt{build\_fault\_dataset.py}, which executes the hierarchical solver over each fault in the ISCAS benchmark suite and records each encountered reconvergent pair as a separate training sample. The constraint density within each sample increases naturally with the solver's execution order: the first pair solved for any given fault carries only the terminus constraint (target node $v_r$), while each subsequent pair inherits all path-node assignments accumulated from previously solved pairs. This produces a training distribution whose constraint density grows from near-zero to heavily constrained, precisely matching the inference distribution without requiring any stochastic ramp schedule at training time.
 
-\textbf{Phase 1 (Epochs 1--$\lfloor 0.25 T\rfloor$)}: During the initial 25\% of total training epochs $T$, only the terminus node of each path (the reconvergent node $v\_r$) is constrained. Anchoring the reconvergence point fixes the target objective while leaving the model free to discover consistent internal assignments without additional supervision. This phase emphasizes structural self-organization through $\mathcal{L}\_{edge}$ and $\mathcal{L}\_{reconv}$.
+All constraint values are circuit-consistent: they originate from actual Boolean simulations under valid Primary Input assignments, which ensures that every supervised gradient signal is satisfiable under the true gate functions. No randomly generated or potentially contradictory constraint values are introduced.
 
-\textbf{Phase 2 (Epochs $\lfloor 0.25 T\rfloor$--$T$)}: Over the remaining 75\% of training, the probability $p\_{extra}$ of additionally constraining interior path nodes is linearly ramped from $0\%$ to $75\%$:
+\subsubsection{Training Optimization Strategies}
+\label{sec:training_opt}
+The training loop in \texttt{src/ml/train.py} employs several strategies for numerical stability and efficient throughput.
+
+\textbf{Gumbel Temperature Annealing}: The temperature $\tau$ is decayed once per epoch according to:
 \begin{equation}
-   p\_{extra}(t) = 0.75 \cdot \frac{t - \lfloor 0.25T \rfloor}{0.75\, T}
+   \tau_t = \max(0.1,\;\tau_0 \cdot 0.99^{\,t-1})
 \end{equation}
-All constraints are populated with circuit-verified Boolean values obtained by simulating random Primary Input (PI) assignments. This ensures every anchor provides a logically consistent gradient signal, avoiding the irresolvable training plateaus that arise from random constraint targets that conflict with gate logic.
+with $\tau_0 = 1.0$. During early epochs the soft distribution encourages exploration; as training progresses and $\tau \to 0.1$, the straight-through estimator produces near-discrete outputs that increasingly resemble Boolean logic. At evaluation time, a fixed $\tau = 0.1$ is used.
 
-Anchor nodes are sampled from the middle 50\% of each path (relative positions 0.25--0.75) to avoid constraining path endpoints, which are reserved for terminus supervision. Together, the anchor supervision loss $\mathcal{L}\_{const}$ and the terminus constraint anchor enforce a grounded, circuit-consistent supervisory signal at increasing density as training progresses.
+\textbf{Mixed Precision and Gradient Clipping}: All forward and backward passes are wrapped in \texttt{torch.amp.autocast} when AMP is enabled, reducing GPU memory consumption. Gradient norms are clipped to a maximum of $1.0$ before each optimizer step to prevent AMP-induced gradient explosions.
 
-\subsection{Verification and Algorithmic Integration}
+\textbf{Path Shuffling}: Path order within each batch item is randomly permuted at every training iteration, preventing the model from learning positional biases between path 0 and path 1.
 
-The core novelty of S-Imply lies in its seamless integration with the structural backtracking engine of PODEM. We replace the non-deterministic search heuristics with a targeted predictive policy.
+\textbf{ShardBatchSampler}: When preprocessed tensor shards are available, the \texttt{ShardBatchSampler} groups all indices belonging to the same shard into each batch. This allows the data loader to extract an entire batch via a single tensor-slice operation instead of one \texttt{clone()} call per sample, reducing CPU overhead by approximately $10\times$.
 
-\subsubsection{The Neural-Augmented Justification Flow}
+\textbf{Learning Rate Schedule}: An AdamW optimizer is used with initial learning rate $\eta = 10^{-4}$. A linear warmup is applied over the first $\min(3, \lfloor T/4 \rfloor)$ epochs, followed by cosine annealing to a minimum learning rate of $10^{-6}$ over the remaining epochs.
 
-The integrated algorithmic flow is summarized in the following procedural steps:
+\subsection{AI-PODEM: Neural-Augmented Justification}
+
+The core novelty of S-Imply lies in its integration with the backtrace engine of PODEM. The \texttt{AIBacktracer} class replaces the standard \texttt{simple\_backtrace} function with a neural oracle that resolves reconvergent objectives hierarchically before delegating residual objectives back to the classical algorithm.
+
+\subsubsection{HierarchicalReconvSolver Algorithm}
+\label{sec:hier_solver}
+
+The \texttt{HierarchicalReconvSolver} is the algorithmic core of the AI-PODEM framework. Given a target gate $v_t$ and required value $\rho$, it executes the following steps:
+
 \begin{enumerate}
-   \item \textbf{Identification}: The netlist is pre-processed to index all valid LRRs ($\mathcal{L}$) and their associated exit lines.
-   \item \textbf{Target Selection}: PODEM selects a fault and identifies a target node $v\_t$ and required value $\text{val}\_r$.
-   \item \textbf{Boundary Intersection}: As the backtrace procedure moves upstream, if $v\_t \in \mathcal{L}$, the engine pauses standard backtracing.
-   \item \textbf{Neural Inference}: The LRR sub-graph is extracted, and the Multi-Path Transformer predicts the vector $\mathbf{a}\_{\mathcal{L}}$.
-   \item \textbf{Consistency Check}: The solver validates if the predicted $\text{val}(v\_t)$ matches $\text{val}\_r$ and checks $S\_{LRR}$.
-   \item \textbf{Assignment Injection}: If valid, all nodes in the LRR are assigned values from $\mathbf{a}\_{\mathcal{L}}$ and entered into the justification queue. Otherwise, the solver falls back to standard PODEM heuristics for that subset.
+   \item \textbf{Transitive Fan-in Collection}: A backward BFS is performed from $v_t$ up to a depth of 20 levels to collect the transitive fan-in cone $\mathcal{C}(v_t)$.
+   \item \textbf{Reconvergent Pair Discovery}: Within $\mathcal{C}(v_t)$, all nodes with out-degree $\geq 2$ (stems) are identified. For each stem $s$, a forward BFS from each direct fan-out branch tracks which branch first-indexes reach subsequent nodes; when a node is reached from $\geq 2$ distinct branches, a reconvergent pair $(s, r)$ is recorded.
+   \item \textbf{Priority Ordering}: Pairs are sorted by a composite cost
+      \begin{equation}
+         \text{cost}(p) = \bigl(\text{total\_path\_len}(p) + \text{dist}(p.\text{reconv},\, v_t),\;
+                           \text{total\_path\_len}(p)\bigr)
+      \end{equation}
+      in ascending lexicographic order, so shorter, topologically closer pairs are resolved first. This ordering reflects the natural execution order in the training data and minimizes the number of constraints that must be inferred before reaching the target.
+   \item \textbf{Iterative Prediction}: Pairs are consumed in priority order. For each pair, the \texttt{ReconvPairPredictor} (\texttt{ModelPairPredictor} in inference) queries the Multi-Path Transformer with the current accumulated constraint dictionary. If the predictor returns a valid assignment, all predicted node values are merged into the running constraint set.
+   \item \textbf{Pair Cache Persistence}: To avoid redundant BFS on repeated calls for the same target (common in PODEM's backtrack-retry cycle), all discovered pairs are stored in a disk-backed pickle cache at \texttt{.reconv\_cache/} alongside each \texttt{.bench} file.
 \end{enumerate}
 
-\subsubsection{Dynamic Boundary Enforcement and Synchronization}
-To ensure the predicted assignments remain valid throughout the global ATPG process, the solver implements a dynamic boundary synchronization mechanism. During the forward implication phase subsequent to any input assignment, any deviation from the predicted logic state within an LRR triggers an immediate predictive re-evaluation.
+\subsubsection{AIBacktracer Integration}
+\label{sec:ai_backtracer}
 
-Furthermore, the solvability index $S\_{LRR}$ acts as an early-exit heuristic. If $S\_{LRR} < 0.5$ for a proposed local objective, the engine preemptively identifies the path as untestable or structurally conflicted without performing the exhaustive branch-and-bound enumeration. This mechanism recognizes mutually exclusive logic requirements that are topologically distant but functionally linked, drastically reducing the search space in dense combinational logic.
+\texttt{AIBacktracer} wraps \texttt{HierarchicalReconvSolver} as a drop-in callable for PODEM's backtrace hook. On each invocation with a PODEM objective \texttt{Fault(gate\_id, value)}:
+
+\begin{enumerate}
+   \item \textbf{Structural Pre-check}: If no reconvergent pairs exist in the transitive fan-in of \texttt{gate\_id} (cached from a prior call), the AI path is bypassed immediately and \texttt{simple\_backtrace} is returned. This fast path eliminates neural inference overhead for fan-out-free regions and primary inputs.
+   \item \textbf{Constraint Extraction}: All Primary Inputs (PIs) currently assigned a definite value (\texttt{ZERO} or \texttt{ONE}) by PODEM's implication state are collected into a constraint dictionary $\mathcal{K}$.
+   \item \textbf{Solver Invocation}: \texttt{HierarchicalReconvSolver.solve(gate\_id, value, $\mathcal{K}$)} is called. The solver traverses the sorted pairs, calling \texttt{ModelPairPredictor.predict()} for each, accumulating a global assignment $\mathbf{a}$.
+   \item \textbf{Result Extraction}: From $\mathbf{a}$, the backtrace searches for a free PI (currently assigned \texttt{XD}). If one is found, it is returned as the next PODEM objective \texttt{Fault(pi\_id, val)}. If no free PI exists but an unassigned internal node is present, \texttt{simple\_backtrace} is delegated with that internal node as a sub-objective.
+   \item \textbf{Fallback}: If the solver returns no assignment (e.g., the predictor rejects all candidate assignments), or if any exception occurs, \texttt{simple\_backtrace} is invoked on the original objective. This ensures S-Imply never degrades coverage below classical PODEM.
+\end{enumerate}
+
+The \texttt{ModelPairPredictor} additionally applies \texttt{post\_process\_logic\_gates()}, a deterministic forward-propagation pass that corrects NOT and BUFF gate outputs along each path based on the current constraint state, enforcing those rigid gate rules before the assignment is returned to PODEM.
 
 \subsubsection{Complexity Analysis}
-Traditional PODEM justification in a circuit with $N$ gates and $D$ decision depth exhibits a worst-case complexity of $O(2^D)$. Reconvergent fanouts exacerbate this by forcing the branch-and-bound engine to explore multiple vertex-disjoint paths repeatedly. In contrast, S-Imply reduces the local decision complexity to $O(1)$ inference.
-While the pre-processing structure identification takes $O(V+E)$, the neural-assisted step reduces the backtracking depth $D$ by a factor proportional to the number of LRRs. For a circuit with $k$ identified LRRs, the search space reduces from $2^D$ to $2^{D - \Delta d \cdot k}$, where $\Delta d$ is the average logic depth of an LRR, providing an exponential speedup in the limit of deep, dense reconvergent logic.
+Traditional PODEM justification in a circuit with $N$ gates and $D$ decision depth exhibits a worst-case complexity of $O(2^D)$. Reconvergent fanouts exacerbate this by forcing the branch-and-bound engine to explore multiple vertex-disjoint paths repeatedly. In contrast, S-Imply reduces the local decision complexity to $O(1)$ inference per LRR.
+While the pre-processing structure identification takes $O(V+E)$, the neural-assisted step reduces the effective backtracking depth $D$ by a factor proportional to the number of LRRs resolved successfully. For a circuit with $k$ identified LRRs, each of average logic depth $\Delta d$, the search space contracts from $2^D$ to $2^{D - \Delta d \cdot k}$, providing an exponential speedup in the limit of dense, deep reconvergent logic. Pair-topology results are persisted to disk after the first run, amortising the $O(V+E)$ BFS cost over all subsequent ATPG invocations on the same circuit.
 
 \section{Experimental Results}
 \% To be completed. Placeholder for Benchmarking Results vs Classical algorithmic runtime and backtracking comparisons on ISCAS85 / ISCAS89.

@@ -12,6 +12,7 @@ import glob
 import json
 import os
 import pickle
+import shutil
 from functools import lru_cache
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
@@ -276,6 +277,7 @@ class ReconvergentPathsDataset(Dataset):
                     meta = json.load(f)
                     self._shard_lens = meta["lens"]
                     self._total_len = sum(self._shard_lens)
+                    self._shard_offsets = self._build_offsets(self._shard_lens)
                     # Initialize LRU Cache
                     from collections import OrderedDict
 
@@ -303,6 +305,7 @@ class ReconvergentPathsDataset(Dataset):
                 raise
 
         self._total_len = total
+        self._shard_offsets = self._build_offsets(self._shard_lens)
         # Initialize LRU Cache
         from collections import OrderedDict
 
@@ -346,14 +349,22 @@ class ReconvergentPathsDataset(Dataset):
         gc.collect()
         print("[DataLoader warmup] Done.", flush=True)
 
+    @staticmethod
+    def _build_offsets(lens: List[int]) -> List[int]:
+        """Build cumulative offset array for O(log n) shard lookup."""
+        offsets = [0]
+        for n in lens:
+            offsets.append(offsets[-1] + n)
+        return offsets
+
     def _get_shard_for_idx(self, idx: int) -> Tuple[int, int]:
-        """Find which shard contains the global index."""
-        # Binary search or linear scan (linear is fine for <1000 shards)
-        for i, length in enumerate(self._shard_lens):
-            if idx < length:
-                return i, idx
-            idx -= length
-        raise IndexError(f"Index {idx} out of range for dataset of size {self._total_len}")
+        """Find which shard contains the global index (O(log n) bisect)."""
+        import bisect
+
+        shard_idx = bisect.bisect_right(self._shard_offsets, idx) - 1
+        if shard_idx < 0 or shard_idx >= len(self._shard_lens):
+            raise IndexError(f"Index {idx} out of range for dataset of size {self._total_len}")
+        return shard_idx, idx - self._shard_offsets[shard_idx]
 
     def _ensure_shard_loaded(self, shard_idx: int):
         """Lazy load shard with LRU caching and RAM awareness."""
@@ -596,8 +607,8 @@ class ReconvergentPathsDataset(Dataset):
             self._ensure_shard_loaded(shard_idx)
         data = self._shard_cache[shard_idx]
 
-        # Compute local indices (offset already subtracted by _get_shard_for_idx)
-        shard_offset = sum(self._shard_lens[:shard_idx])
+        # Compute local indices using precomputed offsets (O(1))
+        shard_offset = self._shard_offsets[shard_idx]
         local_idxs = [i - shard_offset for i in indices]
 
         # Single slice per tensor — O(1) copy instead of O(batch_size) clones
@@ -781,6 +792,7 @@ class ReconvergentPathsDataset(Dataset):
         dtype: torch.dtype = torch.float16,
         device: torch.device = torch.device("cpu"),
         resume: bool = False,
+        archive_dir: str = "",
     ) -> None:
         """Precompute per-sample tensors and save to shard files for fast training.
 
@@ -794,8 +806,17 @@ class ReconvergentPathsDataset(Dataset):
 
         If ``resume=True``, skips chunks already recorded in ``progress.json``
         and continues shard numbering from where the previous run left off.
+
+        If ``archive_dir`` is set, completed shards are moved there after each
+        chunk (freeing space in ``output_dir`` for subsequent chunks).  Useful
+        when ``output_dir`` is on fast-but-small local storage and
+        ``archive_dir`` is on a larger (possibly slower) filesystem.
+        ``progress.json`` remains in ``output_dir``; ``shard_info.json`` is
+        written to both locations when archiving is active.
         """
         os.makedirs(output_dir, exist_ok=True)
+        if archive_dir:
+            os.makedirs(archive_dir, exist_ok=True)
 
         # Resolve input: single pkl or directory of chunk pkls
         if os.path.isdir(input_dataset_path):
@@ -887,7 +908,17 @@ class ReconvergentPathsDataset(Dataset):
             tmp_path = out_path + ".tmp"
             torch.save(shard, tmp_path)
             os.replace(tmp_path, out_path)  # atomic rename — no partial shards on crash
-            tqdm.write(f"Wrote {out_path} ({paths_t.shape[0]} samples)")
+
+            # Immediately move to archive_dir if configured, keeping local storage free
+            if archive_dir:
+                dest = os.path.join(archive_dir, os.path.basename(out_path))
+                tmp_dest = dest + ".tmp"
+                shutil.copy2(out_path, tmp_dest)
+                os.replace(tmp_dest, dest)
+                os.remove(out_path)
+                tqdm.write(f"Archived {os.path.basename(out_path)} ({paths_t.shape[0]} samples)")
+            else:
+                tqdm.write(f"Wrote {out_path} ({paths_t.shape[0]} samples)")
             shard_idx += 1
             buf_paths, buf_masks, buf_nodes, buf_files = [], [], [], []
             buf_ap, buf_al, buf_av, buf_solv = [], [], [], []
@@ -1130,11 +1161,13 @@ class ReconvergentPathsDataset(Dataset):
                     },
                     _pf,
                 )
+
         sample_pbar.close()
         chunk_pbar.close()
         flush()
 
-        shards = sorted(glob.glob(os.path.join(output_dir, "shard_*.pt")))
+        shard_scan_dir = archive_dir if archive_dir else output_dir
+        shards = sorted(glob.glob(os.path.join(shard_scan_dir, "shard_*.pt")))
         lens = []
         for s in shards:
             try:
@@ -1146,12 +1179,122 @@ class ReconvergentPathsDataset(Dataset):
                 pass
 
         if lens:
-            with open(os.path.join(output_dir, "shard_info.json"), "w") as f:
+            info_dir = archive_dir if archive_dir else output_dir
+            with open(os.path.join(info_dir, "shard_info.json"), "w") as f:
                 json.dump({"lens": lens}, f)
 
+        dest_desc = archive_dir if archive_dir else output_dir
+        print(f"Preprocessing complete. {total} samples in {len(lens)} shards saved to {dest_desc}")
+
+    @staticmethod
+    def subset_shards(
+        input_dir: str,
+        output_dir: str,
+        fraction: float = 0.1,
+        seed: int = 42,
+        out_shard_size: int = 10000,
+    ) -> None:
+        """Sample *fraction* of individual samples uniformly across all shards.
+
+        Iterates every shard in *input_dir*, draws a random ``fraction`` of
+        rows from each, and packs the selected rows into new output shards of
+        size *out_shard_size*.  This preserves the full population distribution
+        rather than dropping entire circuit regions.
+
+        Parameters
+        ----------
+        input_dir:
+            Directory with ``shard_XXXXX.pt`` files and ``shard_info.json``.
+        output_dir:
+            Destination directory (created if needed).
+        fraction:
+            Fraction of samples to retain from each shard (default 0.1 = 10%).
+        seed:
+            Random seed for reproducibility.
+        out_shard_size:
+            Number of samples per output shard file.
+        """
+        import json
+        import math
+
+        os.makedirs(output_dir, exist_ok=True)
+
+        all_shards = sorted(glob.glob(os.path.join(input_dir, "shard_*.pt")))
+        if not all_shards:
+            raise FileNotFoundError(f"No shard_*.pt files found in {input_dir}")
+
+        # Load lens from shard_info.json if available
+        info_path = os.path.join(input_dir, "shard_info.json")
+        shard_lens: List[int] = []
+        if os.path.exists(info_path):
+            with open(info_path) as f:
+                shard_lens = json.load(f)["lens"]
+
+        rng = torch.Generator()
+        rng.manual_seed(seed)
+
+        # Accumulators for the current output shard being built
+        buf: Dict[str, List[Any]] = {}
+        out_idx = 0
+        out_lens: List[int] = []
+
+        def _flush_buf() -> None:
+            nonlocal out_idx, buf
+            if not buf:
+                return
+            n = len(next(iter(buf.values())))
+            if n == 0:
+                return
+            shard: Dict[str, Any] = {}
+            for k, v in buf.items():
+                if k == "files":
+                    shard[k] = v
+                else:
+                    shard[k] = torch.stack(v, dim=0) if isinstance(v[0], torch.Tensor) else \
+                                torch.tensor(v)
+            out_path = os.path.join(output_dir, f"shard_{out_idx:05d}.pt")
+            tmp_path = out_path + ".tmp"
+            torch.save(shard, tmp_path)
+            os.replace(tmp_path, out_path)
+            out_lens.append(n)
+            tqdm.write(f"Wrote {out_path} ({n} samples)")
+            out_idx += 1
+            buf.clear()
+
+        total_in = sum(shard_lens) if shard_lens else 0
+        est_out = int(total_in * fraction) if total_in else "?"
         print(
-            f"Preprocessing complete. {total} samples in {len(lens)} shards saved to {output_dir}"
+            f"Subsetting {len(all_shards)} shards at {fraction*100:.0f}% "
+            f"(~{est_out:,} samples) → {output_dir}"
         )
+
+        for shard_path in tqdm(all_shards, desc="Shards"):
+            data = torch.load(shard_path, map_location="cpu", weights_only=True)
+            n = data["paths_emb"].shape[0]
+            n_pick = max(1, math.ceil(n * fraction))
+            # Sample without replacement from this shard
+            perm = torch.randperm(n, generator=rng)[:n_pick]
+
+            for local_i in perm.tolist():
+                # Append one sample to the buffer
+                for k, v in data.items():
+                    if k == "files":
+                        buf.setdefault(k, []).append(v[local_i])
+                    else:
+                        buf.setdefault(k, []).append(v[local_i])
+                if len(buf["paths_emb"]) >= out_shard_size:
+                    _flush_buf()
+
+            del data
+            gc.collect()
+
+        _flush_buf()  # write any remaining samples
+
+        with open(os.path.join(output_dir, "shard_info.json"), "w") as f:
+            json.dump({"lens": out_lens}, f)
+
+        total_out = sum(out_lens)
+        print(f"Done. {out_idx} shards, {total_out:,} samples written to {output_dir}")
 
 
 def reconv_collate(batch: List[Dict[str, Any]], max_paths: int = 0) -> Dict[str, Any]:
@@ -1251,63 +1394,67 @@ if __name__ == "__main__":
     # Minimal CLI to run preprocessing via `python -m src.ml.core.dataset ...`
     import argparse
 
-    parser = argparse.ArgumentParser(description="Preprocess reconvergent dataset to tensor shards")
-    parser.add_argument(
-        "--input",
-        dest="input_dataset_path",
-        type=str,
-        required=True,
-        help="Path to input pickle dataset (from reconv_podem)",
+    parser = argparse.ArgumentParser(
+        description="Preprocess reconvergent dataset to tensor shards, or build a subset"
     )
-    parser.add_argument(
-        "--out",
-        dest="output_dir",
-        type=str,
-        required=True,
-        help="Directory to write shard_XXXXX.pt files",
-    )
-    parser.add_argument(
-        "--max_len",
-        dest="max_path_length",
-        type=int,
-        default=50,
-        help="Fixed path length to pad/truncate to",
-    )
-    parser.add_argument(
-        "--shard_size",
-        dest="shard_size",
-        type=int,
-        default=50000,
-        help="Number of samples per shard file",
-    )
-    parser.add_argument(
-        "--dtype",
-        dest="dtype",
-        type=str,
-        default="float16",
-        choices=["float16", "float32"],
-        help="Data type for stored embeddings",
-    )
+    subparsers = parser.add_subparsers(dest="mode")
 
-    parser.add_argument(
-        "--resume",
-        action="store_true",
-        default=False,
-        help="Resume from progress.json in output dir, skipping already-processed chunks",
+    # ── subset mode ──────────────────────────────────────────────────────────
+    sub_p = subparsers.add_parser(
+        "subset", help="Randomly sample a fraction of existing shards into a new directory"
     )
+    sub_p.add_argument("--input", dest="input_dir", required=True,
+                       help="Directory with full shard_*.pt + shard_info.json")
+    sub_p.add_argument("--out", dest="output_dir", required=True,
+                       help="Destination directory for the subset")
+    sub_p.add_argument("--fraction", type=float, default=0.1,
+                       help="Fraction of samples to retain per shard (default 0.1 = 10%%)")
+    sub_p.add_argument("--seed", type=int, default=42, help="Random seed")
+    sub_p.add_argument("--out_shard_size", type=int, default=10000,
+                       help="Samples per output shard (default 10000)")
+
+    # ── preprocess mode ───────────────────────────────────────────────────────
+    pre_p = subparsers.add_parser("preprocess", help="Preprocess raw chunks to tensor shards")
+    pre_p.add_argument("--input", dest="input_dataset_path", required=True,
+                       help="Path to input pickle dataset or chunk directory")
+    pre_p.add_argument("--out", dest="output_dir", required=True,
+                       help="Directory to write shard_XXXXX.pt files")
+    pre_p.add_argument("--max_len", dest="max_path_length", type=int, default=50,
+                       help="Fixed path length to pad/truncate to")
+    pre_p.add_argument("--shard_size", dest="shard_size", type=int, default=50000,
+                       help="Number of samples per shard file")
+    pre_p.add_argument("--dtype", dest="dtype", type=str, default="float16",
+                       choices=["float16", "float32"],
+                       help="Data type for stored embeddings")
+    pre_p.add_argument("--resume", action="store_true", default=False,
+                       help="Resume from progress.json, skipping already-processed chunks")
+    pre_p.add_argument("--archive_dir", dest="archive_dir", type=str, default="",
+                       help="Move completed shards here after each chunk to free space in --out")
 
     args = parser.parse_args()
-    dtype = torch.float16 if args.dtype == "float16" else torch.float32
 
-    ReconvergentPathsDataset.preprocess_to_shards(
-        input_dataset_path=args.input_dataset_path,
-        output_dir=args.output_dir,
-        max_path_length=args.max_path_length,
-        shard_size=args.shard_size,
-        dtype=dtype,
-        device=torch.device("cpu"),
-        resume=args.resume,
-    )
+    if args.mode == "subset":
+        ReconvergentPathsDataset.subset_shards(
+            input_dir=args.input_dir,
+            output_dir=args.output_dir,
+            fraction=args.fraction,
+            seed=args.seed,
+            out_shard_size=args.out_shard_size,
+        )
+    elif args.mode == "preprocess":
+        dtype = torch.float16 if args.dtype == "float16" else torch.float32
+        ReconvergentPathsDataset.preprocess_to_shards(
+            input_dataset_path=args.input_dataset_path,
+            output_dir=args.output_dir,
+            max_path_length=args.max_path_length,
+            shard_size=args.shard_size,
+            dtype=dtype,
+            device=torch.device("cpu"),
+            resume=args.resume,
+            archive_dir=args.archive_dir,
+        )
+    else:
+        parser.print_help()
 
 
 # -----------------------------------------------------------------------------
